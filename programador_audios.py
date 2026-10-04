@@ -13,11 +13,19 @@ import sqlite3
 import time
 import socket
 import threading
+import tempfile
 import queue
 import subprocess
 import calendar
 import datetime as dt
 import math
+import struct
+import re
+import ssl
+import json
+import hashlib
+import urllib.request
+import webbrowser
 import wave
 import array
 import tkinter as tk
@@ -43,7 +51,7 @@ except Exception:
 
 APP = "ProgramadorAudios"   # nombre interno: carpeta de datos, registro y tarea (no cambiar)
 NOMBRE = "Audiomático"      # nombre que ve el usuario
-VERSION = "1.0.0"           # igual que en instalador.iss
+VERSION = "1.3.0"           # igual que en instalador.iss
 # colores de categoría (se asignan solos, rotando) y fuente exclusiva de la prioridad
 PALETA = ["#d9534f", "#f0ad4e", "#5cb85c", "#3ea6c4", "#6f7bd9", "#a463c9", "#e0679a",
           "#8d6e63"]
@@ -59,7 +67,7 @@ NIVEL_BASE, TOPE_MAX, TOPE_MIN = -16.0, -16.0, -40.0
 REGISTRO = os.path.join(CARPETA, "registro.txt")
 PUERTO = 47653  # para evitar abrir dos copias del programa
 DIAS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
-EXTENSIONES = (".mp3", ".wav", ".ogg")
+EXTENSIONES = (".mp3", ".wav", ".ogg", ".flac")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
@@ -97,7 +105,10 @@ class BD:
                           ("ganancia_db", "REAL"), ("objetivo_db", "REAL"),
                           ("intervalo", "INTEGER DEFAULT 0"),
                           ("int_desde", "TEXT DEFAULT ''"),
-                          ("int_hasta", "TEXT DEFAULT ''")):
+                          ("int_hasta", "TEXT DEFAULT ''"),
+                          ("huella", "TEXT DEFAULT ''"),
+                          ("duracion", "REAL"),
+                          ("problema", "TEXT DEFAULT ''")):
             try:
                 self.c.execute("ALTER TABLE audios ADD COLUMN %s %s" % (col, tipo))
             except sqlite3.OperationalError:
@@ -148,18 +159,138 @@ def recurso(nombre):
     return os.path.join(base, nombre)
 
 
+REPO = "Serchiio/Audiomatico"          # donde se publican las versiones nuevas (GitHub Releases)
+
+
+def version_tupla(txt):
+    """'v1.2.3' -> (1, 2, 3) para comparar versiones."""
+    n = [int(x) for x in re.findall(r"\d+", txt)[:3]]
+    return tuple(n + [0] * (3 - len(n)))
+
+
+def _ctx_ssl():
+    """Conexión segura. Usa los certificados de 'certifi' si están: un Windows 7 sin
+    actualizar puede no tener los certificados raíz que usa GitHub."""
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(certifi.where())
+    except Exception:
+        pass
+    return ctx
+
+
+def _pedir(url, limite=None):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Audiomatico/" + VERSION, "Accept": "application/vnd.github+json"})
+    return urllib.request.urlopen(req, timeout=20, context=_ctx_ssl())
+
+
+def buscar_actualizacion(version_actual=None):
+    """None si ya está al día; si no, dict con version, instalador (url o None), sha256,
+    notas y pagina. Lanza una excepción si no hay conexión."""
+    version_actual = version_actual or VERSION
+    with _pedir("https://api.github.com/repos/%s/releases/latest" % REPO) as r:
+        datos = json.loads(r.read().decode("utf-8"))
+    tag = datos.get("tag_name", "")
+    if version_tupla(tag) <= version_tupla(version_actual):
+        return None
+    info = dict(version=tag.lstrip("vV"), instalador=None, sha256=None,
+                notas=(datos.get("body") or "").strip(), pagina=datos.get("html_url", ""))
+    prefijo = "https://github.com/%s/releases/download/" % REPO
+    assets = datos.get("assets", [])
+    for a in assets:
+        if re.match(r"(?i)^instalar_audiomatico.*\.exe$", a["name"]) \
+                and a["browser_download_url"].startswith(prefijo):
+            info["instalador"] = a["browser_download_url"]
+            sha = (a.get("digest") or "")
+            if sha.startswith("sha256:"):
+                info["sha256"] = sha[7:].lower()
+            else:                                  # o un archivo "<instalador>.sha256"
+                for b in assets:
+                    if b["name"] == a["name"] + ".sha256" \
+                            and b["browser_download_url"].startswith(prefijo):
+                        with _pedir(b["browser_download_url"]) as r2:
+                            m = re.search(r"\b[0-9a-fA-F]{64}\b", r2.read().decode("ascii", "ignore"))
+                        info["sha256"] = m.group(0).lower() if m else None
+            break
+    return info
+
+
+def descargar_verificado(url, destino, sha256, progreso=None):
+    """Descarga 'url' en 'destino' y comprueba su SHA-256. Lanza ValueError si no coincide."""
+    h = hashlib.sha256()
+    with _pedir(url) as r, open(destino, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        hecho = 0
+        for bloque in iter(lambda: r.read(65536), b""):
+            f.write(bloque)
+            h.update(bloque)
+            hecho += len(bloque)
+            if progreso:
+                progreso(hecho, total)
+    if h.hexdigest().lower() != sha256.lower():
+        os.remove(destino)
+        raise ValueError("el archivo descargado no coincide con su huella SHA-256")
+
+
+FORMATO_12H = False      # False: 14:30   True: 2:30 PM (solo cambia lo que se ve; se guarda en 24 h)
+_RE_HORA = re.compile(r"^\s*(\d{1,2})\s*[:.hH]\s*(\d{2})\s*(?:([aApP])\.?\s*[mM]\.?)?\s*$")
+
+
+def parse_hora(txt):
+    """'14:30', '2:30 pm', '2:30 p. m.' -> (14, 30). ValueError si no es una hora válida."""
+    m = _RE_HORA.match(txt)
+    if not m:
+        raise ValueError(txt)
+    h, mi, sufijo = int(m.group(1)), int(m.group(2)), m.group(3)
+    if sufijo:
+        if not 1 <= h <= 12:
+            raise ValueError(txt)
+        h = h % 12 + (12 if sufijo.lower() == "p" else 0)
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        raise ValueError(txt)
+    return h, mi
+
+
+def fmt_hora(hhmm):
+    """'14:30' (como se guarda) -> lo que se muestra según el formato elegido."""
+    if not hhmm:
+        return ""
+    h, m = parse_hora(hhmm)
+    if not FORMATO_12H:
+        return "%02d:%02d" % (h, m)
+    return "%d:%02d %s" % (h % 12 or 12, m, "PM" if h >= 12 else "AM")
+
+
+def fmt_h(h):
+    """Hora entera (0-23) para mostrar: '7' o '7 AM'."""
+    return "%d %s" % (h % 12 or 12, "PM" if h >= 12 else "AM") if FORMATO_12H else str(h)
+
+
+def fmt_horas(lista_csv, sep=" "):
+    """'10:30,13:00' -> '10:30 13:00' o '10:30 AM 1:00 PM' (según el formato)."""
+    return sep.join(fmt_hora(x) for x in lista_csv.split(",") if x)
+
+
 def parse_horas(txt):
     res = []
     for t in txt.replace(";", ",").split(","):
         t = t.strip()
         if not t:
             continue
-        h, m = t.split(":")
-        h, m = int(h), int(m)
-        if not (0 <= h <= 23 and 0 <= m <= 59):
-            raise ValueError(t)
+        h, m = parse_hora(t)
         res.append("%02d:%02d" % (h, m))
     return sorted(set(res))
+
+
+def huella_archivo(ruta):
+    """SHA-1 del contenido de un archivo (para detectar audios repetidos)."""
+    h = hashlib.sha1()
+    with open(ruta, "rb") as f:
+        for bloque in iter(lambda: f.read(1 << 20), b""):
+            h.update(bloque)
+    return h.hexdigest()
 
 
 def parse_minutos(txt):
@@ -179,7 +310,10 @@ def parse_minutos(txt):
 # Nivelación de volumen (decibelios) - solo módulos estándar de Python
 # ----------------------------------------------------------------------
 COMPUERTA_DB = -50.0     # los silencios por debajo de esto no cuentan al medir
-MAX_SEGUNDOS = 900       # audios más largos no se nivelan (memoria)
+# Decodificar un audio lo carga entero en RAM. En Python de 32 bits (Windows 7) un audio
+# largo da MemoryError, así que por encima de este tamaño ya no se analiza ni se nivela
+# (igual se reproduce, en streaming, sin gastar memoria).
+MAX_DECODIFICADO = 90 * 1024 * 1024      # bytes de PCM (unos 8 min en estéreo a 44,1 kHz)
 
 
 try:
@@ -210,15 +344,172 @@ def medir_pcm(raw, canales, frecuencia):
     """(nivel medio en dBFS ignorando silencios, pico en dBFS) de PCM de 16 bits."""
     bloque = max(2, int(frecuencia * 0.1)) * canales * 2
     suma, n = 0.0, 0
+    suma_todo, n_todo = 0.0, 0
     umbral = 32768.0 * 10 ** (COMPUERTA_DB / 20.0)
     for i in range(0, len(raw) - bloque + 1, bloque):
         r = audioop.rms(raw[i:i + bloque], 2)
+        suma_todo += float(r) * r
+        n_todo += 1
         if r >= umbral:
             suma += float(r) * r
             n += 1
-    if n == 0:
-        return None, None
+    if n == 0:                      # todo por debajo del umbral: audio muy bajo, no es un error
+        if suma_todo <= 0:
+            return None, None       # silencio total (todo ceros)
+        return _db(math.sqrt(suma_todo / n_todo)), _db(audioop.max(raw, 2))
     return _db(math.sqrt(suma / n)), _db(audioop.max(raw, 2))
+
+
+def decodificado_estimado(ruta):
+    """Bytes de PCM que ocuparía el audio decodificado, sin decodificarlo."""
+    tam = os.path.getsize(ruta)
+    if ruta.lower().endswith(".wav"):
+        try:
+            with wave.open(ruta, "rb") as w:
+                return int(w.getnframes() / float(w.getframerate()) * 176400)
+        except Exception:
+            return tam * 4
+    return tam * 10          # mp3/ogg: unas 10 veces más grande al decodificar
+
+
+def duracion_estimada(ruta):
+    """Segundos aproximados de un audio, sin decodificarlo (WAV exacto; mp3/ogg a ~128 kbps)."""
+    try:
+        if ruta.lower().endswith(".wav"):
+            with wave.open(ruta, "rb") as w:
+                return w.getnframes() / float(w.getframerate())
+        return os.path.getsize(ruta) / 16000.0
+    except Exception:
+        return 0.0
+
+
+def analizar_audio(ruta):
+    """(duración, envolvente, nivel dB, motivo). Nunca lanza: si no se puede analizar
+    devuelve (0, [], None, 'motivo') y el audio se reproduce igual, sin nivelar."""
+    try:
+        raw, frec, canales = cargar_pcm(ruta)
+        env = envolvente(raw, canales, frec)
+        nivel = medir_pcm(raw, canales, frec)[0]
+        return len(raw) / float(frec * canales * 2), env, nivel, ""
+    except Exception as e:                    # incluye MemoryError
+        return 0.0, [], None, motivo_error(e)
+
+
+def motivo_error(e):
+    """Texto corto y útil de una excepción (MemoryError viene con el texto vacío)."""
+    if isinstance(e, ValueError):
+        return str(e)
+    return "%s: %s" % (type(e).__name__, e)
+
+
+def leer_wav_generico(ruta, frec_destino, canales_destino=2):
+    """Respaldo para WAV que SDL no abre: PCM de 8/16/24/32 bits, float de 32/64 bits,
+    A-law y mu-law, formato 'extensible', 1 o más canales y cualquier frecuencia.
+    Devuelve PCM de 16 bits con la frecuencia y canales de la mezcla."""
+    with open(ruta, "rb") as f:
+        d = f.read()
+    if d[:4] != b"RIFF" or d[8:12] != b"WAVE":
+        raise ValueError("no es un archivo WAV válido")
+    pos, fmt, pcm = 12, None, None
+    while pos + 8 <= len(d):
+        tid, tam = d[pos:pos + 4], struct.unpack("<I", d[pos + 4:pos + 8])[0]
+        cuerpo = d[pos + 8:pos + 8 + tam]
+        if tid == b"fmt ":
+            fmt = cuerpo
+        elif tid == b"data":
+            pcm = cuerpo
+        pos += 8 + tam + (tam & 1)
+    if fmt is None or pcm is None:
+        raise ValueError("el WAV está incompleto")
+    tag, canales, frec, _, _, bits = struct.unpack("<HHIIHH", fmt[:16])
+    if tag == 0xFFFE and len(fmt) >= 26:                    # WAVE_FORMAT_EXTENSIBLE
+        tag = struct.unpack("<H", fmt[24:26])[0]
+    ancho = max(1, bits // 8)
+    pcm = pcm[:len(pcm) - len(pcm) % (ancho * canales)]
+    if tag == 1:
+        if bits == 8:
+            raw = audioop.lin2lin(audioop.bias(pcm, 1, -128), 1, 2)
+        elif bits in (16, 24, 32):
+            raw = pcm if bits == 16 else audioop.lin2lin(pcm, ancho, 2)
+        else:
+            raise ValueError("WAV de %d bits no soportado" % bits)
+    elif tag == 3 and bits in (32, 64):                     # coma flotante
+        if len(pcm) > 120 * 1024 * 1024:
+            raise ValueError("WAV de coma flotante demasiado grande")
+        v = array.array("f" if bits == 32 else "d", pcm)
+        raw = array.array("h", [max(-32768, min(32767, int(x * 32767))) for x in v]).tobytes()
+    elif tag == 6:
+        raw = audioop.alaw2lin(pcm, 2)
+    elif tag == 7:
+        raw = audioop.ulaw2lin(pcm, 2)
+    else:
+        raise ValueError("WAV con formato de compresión %d no soportado" % tag)
+    if canales > 2:                                         # se queda con los dos primeros
+        a = array.array("h", raw)
+        st = array.array("h", [0]) * (len(a) // canales * 2)
+        st[0::2], st[1::2] = a[0::canales], a[1::canales]
+        raw, canales = st.tobytes(), 2
+    if canales != canales_destino:
+        raw = (audioop.tostereo(raw, 2, 1, 1) if canales_destino == 2
+               else audioop.tomono(raw, 2, 0.5, 0.5))
+    if frec != frec_destino:
+        raw, _ = audioop.ratecv(raw, 2, canales_destino, frec, frec_destino, None)
+    return raw
+
+
+def cargar_pcm(ruta):
+    """(PCM 16 bits, frecuencia, canales) de un audio, con respaldo si SDL no lo abre.
+    Lanza ValueError con un motivo claro si no se puede leer."""
+    init = pygame.mixer.get_init()
+    if not init or init[1] != -16:
+        raise ValueError("formato de mezcla no soportado")
+    est = decodificado_estimado(ruta)          # ANTES de decodificar: Sound() carga todo en RAM
+    if est > MAX_DECODIFICADO:
+        raise ValueError("es muy largo (unos %d min)" % (est / 176400 // 60))
+    try:
+        snd = pygame.mixer.Sound(ruta)
+        raw = snd.get_raw()
+        del snd
+        return raw, init[0], init[2]
+    except Exception as e1:
+        if ruta.lower().endswith(".wav"):
+            try:
+                return leer_wav_generico(ruta, init[0], init[2]), init[0], init[2]
+            except Exception as e2:
+                raise ValueError("no se pudo leer el audio (%s | %s)" % (
+                    motivo_error(e1), motivo_error(e2)))
+        raise ValueError("no se pudo leer el audio: %s. Conviértelo a MP3 o WAV estándar." %
+                         motivo_error(e1))
+
+
+def recortar_silencios(raw, canales, frec, margen=0.3, umbral_db=-60.0, minimo=1.0):
+    """Quita el silencio sobrante al inicio y al final (deja 'margen' s de aire).
+    Solo recorta si se ahorra al menos 'minimo' s. Devuelve (PCM, segundos quitados)."""
+    paso = 0.05
+    bloque = max(2, int(frec * paso)) * canales * 2
+    n = len(raw) // bloque
+    if n == 0:
+        return raw, 0.0
+    umbral = 32768.0 * 10 ** (umbral_db / 20.0)
+    activos = [i for i in range(n) if audioop.rms(raw[i * bloque:(i + 1) * bloque], 2) >= umbral]
+    if not activos:                                         # todo en silencio: no se toca
+        return raw, 0.0
+    m = int(round(margen / paso))
+    ini, fin = max(0, activos[0] - m), min(n, activos[-1] + 1 + m)
+    quitado = (ini + (n - fin)) * paso
+    if quitado < minimo:
+        return raw, 0.0
+    cola = raw[n * bloque:] if fin == n else b""
+    return raw[ini * bloque:fin * bloque] + cola, quitado
+
+
+def analizar_sound(snd):
+    """(duración, envolvente, nivel medio dB) de un Sound ya decodificado."""
+    init = pygame.mixer.get_init()
+    raw = snd.get_raw()
+    env = envolvente(raw, init[2], init[0])
+    nivel = medir_pcm(raw, init[2], init[0])[0]
+    return snd.get_length(), env, nivel
 
 
 PASO_ENV = 0.04          # segundos por muestra del vúmetro
@@ -231,31 +522,28 @@ def envolvente(raw, canales, frecuencia):
             for i in range(0, len(raw) - bloque + 1, bloque)]
 
 
-def nivelar_archivo(ruta, destino, objetivo, techo):
+def nivelar_archivo(ruta, destino, objetivo, techo, recortar=False):
     """
-    Crea en 'destino' una copia WAV con el volumen llevado al nivel 'objetivo'
-    (dBFS). Nunca deja picos por encima de 'techo' (no hay distorsión), así que un
-    audio muy fuerte se baja y uno muy débil se sube hasta donde los picos permitan.
-    Devuelve (nivel_original, ganancia_db). Si no hace falta cambiar nada devuelve
-    ganancia 0 y no escribe el archivo.
+    Crea en 'destino' una copia WAV estándar (16 bits) con el volumen llevado al nivel
+    'objetivo' (dBFS). Nunca deja picos por encima de 'techo' (no hay distorsión), así que
+    un audio muy fuerte se baja y uno muy débil se sube hasta donde los picos permitan.
+    Con recortar=True quita el silencio sobrante al inicio y al final.
+    Devuelve (nivel_original, ganancia_db, duración_s, segundos_recortados).
     """
-    snd = pygame.mixer.Sound(ruta)
-    init = pygame.mixer.get_init()
-    if not init or init[1] != -16:
-        raise ValueError("formato de mezcla no soportado")
-    frec, _, canales = init
-    if snd.get_length() > MAX_SEGUNDOS:
-        raise ValueError("audio demasiado largo para nivelar")
-    raw = snd.get_raw()
+    raw, frec, canales = cargar_pcm(ruta)
+    quitado = 0.0
+    if recortar:
+        raw, quitado = recortar_silencios(raw, canales, frec)
     nivel, pico = medir_pcm(raw, canales, frec)
     if nivel is None:
-        raise ValueError("el audio está en silencio")
+        raise ValueError("el archivo no tiene sonido (silencio total)")
     g = objetivo - nivel
     if pico + g > techo:          # tope: sin recortes
         g = techo - pico
-    g = max(-30.0, min(20.0, g))
+    g = max(-30.0, min(30.0, g))
     if abs(g) < 0.3:
-        return nivel, 0.0
+        g = 0.0     # igual se escribe la copia: deja todo en WAV estándar de 16 bits,
+                    # que suena siempre (8/24 bits, mp3 raros, etc.)
     out = audioop.mul(raw, 2, 10 ** (g / 20.0))
     w = wave.open(destino, "wb")
     try:
@@ -265,7 +553,7 @@ def nivelar_archivo(ruta, destino, objetivo, techo):
         w.writeframes(out)
     finally:
         w.close()
-    return nivel, g
+    return nivel, g, len(out) / float(frec * canales * 2), quitado
 
 
 def sumar_meses(fecha, n):
@@ -302,12 +590,58 @@ def le_toca(a, ahora):
     return False
 
 
+def proximas_emisiones(audios, desde, horizonte_min, limite):
+    """[(instante, audio)] de las próximas emisiones, en orden: primero por hora y, a la
+    misma hora, los de prioridad (así los pondría en cola el programa)."""
+    # Rápido: las horas del día de cada audio se calculan una sola vez (no se prueba minuto
+    # a minuto con todos los audios, que en un equipo lento congelaría la ventana).
+    fin = desde + dt.timedelta(minutes=horizonte_min)
+    res = []
+    for a in audios:
+        minutos = minutos_programados(a)
+        if not minutos:
+            continue
+        dia = desde.replace(hour=0, minute=0)
+        while dia <= fin:
+            if dia_permitido(a, dia):
+                for m in minutos:
+                    t = dia + dt.timedelta(minutes=m)
+                    if desde < t <= fin:
+                        res.append((t, a))
+            dia += dt.timedelta(days=1)
+    res.sort(key=lambda x: (x[0], -x[1]["prioridad"]))
+    return res[:limite]
+
+
+def minutos_programados(a):
+    """Conjunto de minutos del día (0-1439) en los que suena el audio (sin mirar el día)."""
+    res = set()
+    for h in a["horas"].split(","):
+        if h:
+            hh, mm = h.split(":")
+            res.add(int(hh) * 60 + int(mm))
+    mins = [int(m) for m in a["minutos"].split(",") if m != ""]
+    for hora in range(a["hora_desde"], a["hora_hasta"] + 1):
+        res.update(hora * 60 + m for m in mins)
+    n = a["intervalo"] or 0
+    if n > 0 and a["int_desde"] and a["int_hasta"]:
+        res.update(range(hhmm_a_min(a["int_desde"]), hhmm_a_min(a["int_hasta"]) + 1, n))
+    return res
+
+
+def dia_permitido(a, fecha):
+    """True si el audio puede sonar ese día (activo, vigente y día de la semana)."""
+    if not a["activo"]:
+        return False
+    hoy = fecha.date().isoformat()
+    if (a["fecha_inicio"] and hoy < a["fecha_inicio"]) or (a["fecha_fin"] and hoy > a["fecha_fin"]):
+        return False
+    return fecha.weekday() in [int(d) for d in a["dias"].split(",") if d != ""]
+
+
 def hhmm_a_min(txt):
-    """'09:30' -> minutos desde las 00:00 (ValueError si el formato es inválido)."""
-    h, m = txt.strip().split(":")
-    h, m = int(h), int(m)
-    if not (0 <= h <= 23 and 0 <= m <= 59):
-        raise ValueError(txt)
+    """'09:30' o '9:30 AM' -> minutos desde las 00:00 (ValueError si el formato es inválido)."""
+    h, m = parse_hora(txt)
     return h * 60 + m
 
 
@@ -380,37 +714,53 @@ def instancia_unica(mostrar):
 
 
 # ----------------------------------------------------------------------
-# Volumen maestro de Windows (la salida de audio del equipo)
+# Volumen de Audiomático en el Mezclador de Windows
 # ----------------------------------------------------------------------
 class VolumenWindows:
+    """Volumen propio de Audiomático en el Mezclador de volumen de Windows.
+    No toca el volumen general del equipo: solo el control de esta aplicación."""
+
     def __init__(self):
-        self.ep = None
+        self.vol = None
+        self._buscar()
+
+    def _buscar(self):
+        """La sesión de audio de este programa aparece cuando abre la tarjeta de sonido."""
+        self.vol = None
+        if AudioUtilities is None:
+            return
         try:
-            from ctypes import cast, POINTER
-            from comtypes import CLSCTX_ALL
-            from pycaw.pycaw import IAudioEndpointVolume
-            disp = AudioUtilities.GetSpeakers()
-            iface = disp.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            self.ep = cast(iface, POINTER(IAudioEndpointVolume))
+            pid = os.getpid()
+            for s in AudioUtilities.GetAllSessions():
+                if s.ProcessId == pid:
+                    self.vol = s.SimpleAudioVolume
+                    return
         except Exception:
-            self.ep = None
+            self.vol = None
 
     def disponible(self):
-        return self.ep is not None
+        if self.vol is None:
+            self._buscar()
+        return self.vol is not None
 
     def leer(self):
         """(porcentaje 0-100, decibelios) o None."""
+        if not self.disponible():
+            return None
         try:
-            return (self.ep.GetMasterVolumeLevelScalar() * 100.0,
-                    self.ep.GetMasterVolumeLevel())
+            v = self.vol.GetMasterVolume()
+            return v * 100.0, (20.0 * math.log10(v) if v > 0.001 else -99.0)
         except Exception:
+            self.vol = None
             return None
 
     def poner(self, pct):
+        if not self.disponible():
+            return
         try:
-            self.ep.SetMasterVolumeLevelScalar(max(0.0, min(1.0, pct / 100.0)), None)
+            self.vol.SetMasterVolume(max(0.0, min(1.0, pct / 100.0)), None)
         except Exception:
-            pass
+            self.vol = None
 
 
 # ----------------------------------------------------------------------
@@ -419,7 +769,11 @@ class VolumenWindows:
 # ----------------------------------------------------------------------
 class Reproductor:
     def __init__(self, log, factor):
-        pygame.mixer.init()
+        try:   # formato fijo (16 bits, estéreo): SDL convierte si la tarjeta es distinta
+            pygame.mixer.init(44100, -16, 2, 2048, allowedchanges=0)
+        except Exception:
+            pygame.mixer.quit()
+            pygame.mixer.init()
         pygame.mixer.set_num_channels(8)
         self.log = log
         # --- parámetros (se cambian desde Sistema) ---
@@ -431,6 +785,8 @@ class Reproductor:
         self.tope = -20.0             # dB: nivel máximo (medio) de los audios
         self.techo = -1.0             # dB: tope de picos al nivelar
         self.usar_norm = True         # usar la copia nivelada si existe
+        self.al_fallo = None          # función(audio, motivo): un audio no pudo sonar
+        self.al_exito = None          # función(audio): un audio empezó a sonar bien
         # --- voz normal (música/streaming de pygame) ---
         self.actual = None
         self.pausado = False          # pausa pedida por el usuario
@@ -481,16 +837,12 @@ class Reproductor:
         except (IndexError, KeyError):
             return 0.0
 
-    @staticmethod
-    def _analizar(snd):
-        """(duración, envolvente para el vúmetro, nivel medio en dB)."""
-        dur = snd.get_length()
-        env, nivel = [], None
-        init = pygame.mixer.get_init()
-        if init and init[1] == -16 and dur <= MAX_SEGUNDOS:
-            raw = snd.get_raw()
-            env = envolvente(raw, init[2], init[0])
-            nivel = medir_pcm(raw, init[2], init[0])[0]
+    def _analizar(self, a, ruta):
+        """(duración, envolvente para el vúmetro, nivel medio en dB). Si no se puede
+        analizar (audio largo, poca memoria...) devuelve valores vacíos y lo avisa."""
+        dur, env, nivel, motivo = analizar_audio(ruta)
+        if motivo:
+            self.log("Aviso: '%s' suena sin nivelar el volumen (%s)." % (a["nombre"], motivo))
         return dur, env, nivel
 
     def _factor(self, nivel):
@@ -517,14 +869,42 @@ class Reproductor:
         return self.offset + max(0, pygame.mixer.music.get_pos()) / 1000.0
 
     # ---------- voz normal ----------
+    def _copia_estandar(self, a, ruta):
+        """Convierte un audio que no abre a WAV estándar (en una caché) y devuelve su ruta."""
+        try:
+            carpeta = os.path.join(CARPETA_AUDIOS, "cache")
+            os.makedirs(carpeta, exist_ok=True)
+            dest = os.path.join(carpeta, "c_%s_%d.wav" % (a["id"], int(os.path.getmtime(ruta))))
+            if not os.path.exists(dest):
+                raw, frec, canales = cargar_pcm(ruta)
+                w = wave.open(dest, "wb")
+                try:
+                    w.setnchannels(canales)
+                    w.setsampwidth(2)
+                    w.setframerate(frec)
+                    w.writeframes(raw)
+                finally:
+                    w.close()
+            return dest
+        except Exception:
+            return None
+
     def _tocar_normal(self, a, inicio=0.0):
         try:
             ruta = self.ruta_de(a)
-            snd = pygame.mixer.Sound(ruta)
-            self.duracion, self.env, self.nivel_play = self._analizar(snd)
-            del snd
+            if not os.path.exists(ruta):
+                raise FileNotFoundError("el archivo de audio ya no existe")
+            self.duracion, self.env, self.nivel_play = self._analizar(a, ruta)
             self.ganancia = self._ganancia_de(a, ruta)
-            pygame.mixer.music.load(ruta)
+            try:
+                pygame.mixer.music.load(ruta)
+            except Exception as e1:                 # no abre tal cual: se prueba una copia estándar
+                alt = self._copia_estandar(a, ruta)
+                if alt is None:
+                    raise
+                self.log("Aviso: '%s' no se pudo abrir tal cual (%s); suena desde una copia "
+                         "convertida." % (a["nombre"], motivo_error(e1)))
+                pygame.mixer.music.load(alt)
             pygame.mixer.music.set_volume(0.0)      # el fundido lo sube
             if inicio > 0:
                 try:
@@ -538,13 +918,18 @@ class Reproductor:
             self.pausado = False
             return True
         except Exception as e:
-            self.log("ERROR al reproducir '%s': %s" % (a["nombre"], e))
+            motivo = motivo_error(e)
+            self.log("ERROR al reproducir '%s': %s" % (a["nombre"], motivo))
+            if self.al_fallo:
+                self.al_fallo(a, motivo)
             return False
 
     def _iniciar_normal(self, a):
         if self._tocar_normal(a):
             self.actual = a
             self.log("Reproduciendo: %s" % a["nombre"])
+            if self.al_exito:
+                self.al_exito(a)
             return True
         return False
 
@@ -560,15 +945,28 @@ class Reproductor:
     def _iniciar_prio(self, a):
         try:
             ruta = self.ruta_de(a)
-            snd = pygame.mixer.Sound(ruta)
-            dur, env, nivel = self._analizar(snd)
+            if not os.path.exists(ruta):
+                raise FileNotFoundError("el archivo de audio ya no existe")
+            if decodificado_estimado(ruta) > MAX_DECODIFICADO:
+                raise ValueError("es demasiado largo para mezclarlo encima de otro audio")
+            try:
+                snd = pygame.mixer.Sound(ruta)
+            except Exception:                       # SDL no lo abre: respaldo propio
+                snd = pygame.mixer.Sound(buffer=cargar_pcm(ruta)[0])
+            try:
+                dur, env, nivel = analizar_sound(snd)
+            except Exception as e:            # sin vúmetro ni tope, pero suena
+                dur, env, nivel = snd.get_length(), [], None
+                self.log("Aviso: '%s' suena sin nivelar el volumen (%s: %s)."
+                         % (a["nombre"], type(e).__name__, e))
             snd.set_volume(0.0)
             canal = snd.play()
             if canal is None:
                 canal = pygame.mixer.find_channel(True)
                 canal.play(snd)
         except Exception as e:
-            self.log("ERROR al reproducir '%s': %s" % (a["nombre"], e))
+            self.log("Aviso: '%s' se reproducirá como audio normal (%s: %s)."
+                     % (a["nombre"], type(e).__name__, e))
             return False
         self.prio_actual, self.prio_snd, self.canal = a, snd, canal
         self.prio_pos, self.prio_dur, self.prio_env = 0.0, dur, env
@@ -579,6 +977,8 @@ class Reproductor:
             pygame.mixer.music.pause()
             self.pausa_por_prio = True
         self.log("Reproduciendo (PRIORIDAD): %s" % a["nombre"])
+        if self.al_exito:
+            self.al_exito(a)
         return True
 
     def _fin_prio(self):
@@ -586,8 +986,10 @@ class Reproductor:
         self.prio_env = []
         self.vol_prio = 0.0
         while self.cola_prio:
-            if self._iniciar_prio(self.cola_prio.pop(0)):
+            sig = self.cola_prio.pop(0)
+            if self._iniciar_prio(sig):
                 return
+            self._como_normal(sig)
         self.duck_meta = 0.0                         # el damper vuelve a subir
         if self.pausa_por_prio:
             self.pausa_por_prio = False
@@ -597,6 +999,14 @@ class Reproductor:
             self.espera_hasta = time.time() + self.espera
             if self.actual is None:
                 self.log("Esperando %d s antes de: %s" % (self.espera, self.cola[0]["nombre"]))
+
+    def _como_normal(self, a):
+        """Un audio con prioridad que no se puede mezclar encima sigue su camino como normal."""
+        if (self.actual is None and self.prio_actual is None and not self.cola
+                and time.time() >= self.espera_hasta):
+            self._iniciar_normal(a)
+        else:
+            self.cola.insert(0, a)
 
     # ---------- cola ----------
     def agregar(self, a):
@@ -609,7 +1019,7 @@ class Reproductor:
         if a["prioridad"]:
             if self.prio_actual is None:
                 if not self._iniciar_prio(a):
-                    return
+                    self._como_normal(a)
             else:
                 self.cola_prio.append(a)
                 self.log("En cola (prioridad): %s" % a["nombre"])
@@ -814,10 +1224,11 @@ class DialogoAudio(tk.Toplevel):
     VIGENCIAS = ["Indefinido", "1 mes", "3 meses", "6 meses", "1 año", "Fecha exacta"]
     MESES = {"1 mes": 1, "3 meses": 3, "6 meses": 6, "1 año": 12}
 
-    def __init__(self, app, audio=None):
+    def __init__(self, app, audio=None, archivo=None):
         super().__init__(app.root)
         self.app = app
         self.audio = audio
+        self._guardando = False
         self.title("Editar audio" if audio else "Añadir audio")
         self.transient(app.root)
         self.resizable(False, False)
@@ -871,7 +1282,8 @@ class DialogoAudio(tk.Toplevel):
         ttk.Label(f, text="Horas exactas:").grid(row=r, column=0, sticky="e", pady=3)
         self.v_horas = tk.StringVar()
         ttk.Entry(f, textvariable=self.v_horas, width=30).grid(row=r, column=1, sticky="w")
-        ttk.Label(f, text="Ej: 08:00, 13:30, 17:45").grid(
+        ttk.Label(f, text="Ej: " + ", ".join(fmt_hora(x) for x in ("08:00", "13:30", "17:45"))
+                  + "  (acepta también AM/PM)").grid(
             row=r, column=2, columnspan=2, sticky="w")
         r += 1
 
@@ -897,13 +1309,13 @@ class DialogoAudio(tk.Toplevel):
         fi = ttk.Frame(f)
         fi.grid(row=r, column=1, columnspan=3, sticky="w")
         self.v_int = tk.StringVar(value="0")
-        self.v_int_desde = tk.StringVar(value="09:00")
-        self.v_int_hasta = tk.StringVar(value="22:00")
+        self.v_int_desde = tk.StringVar(value=fmt_hora("09:00"))
+        self.v_int_hasta = tk.StringVar(value=fmt_hora("22:00"))
         ttk.Spinbox(fi, from_=0, to=720, width=4, textvariable=self.v_int).pack(side="left")
         ttk.Label(fi, text=" min, de ").pack(side="left")
-        ttk.Entry(fi, textvariable=self.v_int_desde, width=6).pack(side="left")
+        ttk.Entry(fi, textvariable=self.v_int_desde, width=9).pack(side="left")
         ttk.Label(fi, text=" a ").pack(side="left")
-        ttk.Entry(fi, textvariable=self.v_int_hasta, width=6).pack(side="left")
+        ttk.Entry(fi, textvariable=self.v_int_hasta, width=9).pack(side="left")
         ttk.Label(fi, text="  (0 = no repetir; cuenta desde la hora inicial)").pack(side="left")
         r += 1
         ttk.Label(f, text="Las tres formas de programar son independientes: el audio suena "
@@ -929,6 +1341,9 @@ class DialogoAudio(tk.Toplevel):
 
         if audio:
             self.cargar(audio)
+        elif archivo:                      # llegó arrastrado a la ventana
+            self.v_ruta.set(archivo)
+            self.v_nombre.set(os.path.splitext(os.path.basename(archivo))[0])
 
     def cargar(self, a):
         self.v_nombre.set(a["nombre"])
@@ -941,15 +1356,15 @@ class DialogoAudio(tk.Toplevel):
         activos = [int(d) for d in a["dias"].split(",") if d != ""]
         for i, v in enumerate(self.v_dias):
             v.set(1 if i in activos else 0)
-        self.v_horas.set(a["horas"].replace(",", ", "))
+        self.v_horas.set(fmt_horas(a["horas"], ", "))
         self.v_min.set(a["minutos"].replace(",", ", "))
         self.v_desde.set(str(a["hora_desde"]))
         self.v_hasta.set(str(a["hora_hasta"]))
         self.v_int.set(str(a["intervalo"] or 0))
         if a["int_desde"]:
-            self.v_int_desde.set(a["int_desde"])
+            self.v_int_desde.set(fmt_hora(a["int_desde"]))
         if a["int_hasta"]:
-            self.v_int_hasta.set(a["int_hasta"])
+            self.v_int_hasta.set(fmt_hora(a["int_hasta"]))
         if a["fecha_fin"]:
             self.v_vig.set("Fecha exacta")
             self.v_fecha.set(a["fecha_fin"])
@@ -957,7 +1372,7 @@ class DialogoAudio(tk.Toplevel):
     def examinar(self):
         ruta = filedialog.askopenfilename(
             parent=self, title="Elegir audio",
-            filetypes=[("Audio", "*.mp3 *.wav *.ogg"), ("Todos", "*.*")])
+            filetypes=[("Audio", "*.mp3 *.wav *.ogg *.flac"), ("Todos", "*.*")])
         if ruta:
             self.v_ruta.set(ruta)
             if not self.v_nombre.get():
@@ -970,7 +1385,7 @@ class DialogoAudio(tk.Toplevel):
             messagebox.showwarning("Falta información", "Indica nombre y archivo.", parent=self)
             return
         if not ruta.lower().endswith(EXTENSIONES):
-            messagebox.showwarning("Formato", "Usa archivos MP3, WAV u OGG.", parent=self)
+            messagebox.showwarning("Formato", "Usa archivos MP3, WAV, OGG o FLAC.", parent=self)
             return
         try:
             horas = parse_horas(self.v_horas.get())
@@ -1016,6 +1431,21 @@ class DialogoAudio(tk.Toplevel):
         else:
             fin = sumar_meses(hoy, self.MESES[vig]).isoformat()
 
+        # evitar audios repetidos (mismo archivo o mismo nombre)
+        huella = ""
+        nuevo_o_cambiado = (not self.audio or ruta != self.audio["ruta"]
+                            or nombre != self.audio["nombre"])
+        if nuevo_o_cambiado:
+            aviso, huella = self.app.buscar_duplicado(
+                ruta, nombre, self.audio["id"] if self.audio else None)
+            if aviso and not messagebox.askyesno(
+                    "Posible audio repetido", aviso + "\n\n¿Añadirlo de todos modos?",
+                    default="no", parent=self):
+                return
+        if self._guardando:         # doble clic en Guardar: no crear dos veces el mismo audio
+            return
+        self._guardando = True
+
         # copiar el audio a la carpeta del programa (por si lo mueven de lugar)
         if os.path.dirname(os.path.abspath(ruta)) != os.path.abspath(CARPETA_AUDIOS):
             destino = os.path.join(CARPETA_AUDIOS, "%d_%s" % (
@@ -1023,6 +1453,7 @@ class DialogoAudio(tk.Toplevel):
             try:
                 shutil.copy2(ruta, destino)
             except Exception as e:
+                self._guardando = False
                 messagebox.showerror("Error", "No se pudo copiar el audio:\n%s" % e, parent=self)
                 return
             ruta = destino
@@ -1049,12 +1480,92 @@ class DialogoAudio(tk.Toplevel):
                        "fecha_inicio) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                        datos + (hoy.isoformat(),)).lastrowid
             cambio = True
+        if huella:
+            db.x("UPDATE audios SET huella=? WHERE id=?", (huella, aid))
         if cambio:
             self.config(cursor="watch")
             self.update_idletasks()
         self.app.nivelar_audio(aid, forzar=cambio)
         self.app.refrescar_audios()
+        # avisos útiles al guardar: problemas con el archivo y choques de programación
+        avisos = []
+        r = db.q("SELECT problema FROM audios WHERE id=?", (aid,))
+        if r and r[0]["problema"]:
+            avisos.append("No se pudo analizar este audio: %s\nPuede que suene igual; pruébalo "
+                          "con «Probar ahora»." % r[0]["problema"])
+        conf = [txt for ids, txt in self.app.conflictos() if aid in ids]
+        if conf:
+            avisos.append("Conflictos de programación:\n" + "\n".join("• " + c for c in conf[:4])
+                          + ("\n(y %d más; mira Sistema → Revisar conflictos)" % (len(conf) - 4)
+                             if len(conf) > 4 else ""))
+        if avisos:
+            self.config(cursor="")
+            messagebox.showwarning("Revisa este audio", "\n\n".join(avisos), parent=self)
         self.destroy()
+
+
+# ----------------------------------------------------------------------
+# Arrastrar y soltar archivos desde el Explorador (API de Windows, sin librerías extra)
+# ----------------------------------------------------------------------
+class SoltarArchivos:
+    WM_DROPFILES, WM_COPYGLOBALDATA, GWL_WNDPROC = 0x0233, 0x0049, -4
+
+    def __init__(self, root, al_soltar):
+        import ctypes
+        from ctypes import wintypes
+        self.ct, self.root, self.al_soltar = ctypes, root, al_soltar
+        self.buzon = []
+        user32, shell32 = ctypes.windll.user32, ctypes.windll.shell32
+        self.shell32 = shell32
+        lresult = ctypes.c_ssize_t
+        proc_t = ctypes.WINFUNCTYPE(lresult, wintypes.HWND, wintypes.UINT,
+                                    wintypes.WPARAM, wintypes.LPARAM)
+        self.llamar = user32.CallWindowProcW
+        self.llamar.restype = lresult
+        self.llamar.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
+                                wintypes.WPARAM, wintypes.LPARAM]
+        shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, wintypes.UINT, wintypes.LPWSTR,
+                                           wintypes.UINT]
+        shell32.DragFinish.argtypes = [ctypes.c_void_p]
+        set_long = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+        set_long.restype = ctypes.c_void_p
+        set_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+
+        self.hwnd = int(root.wm_frame(), 16)          # el marco de la ventana
+        shell32.DragAcceptFiles(self.hwnd, True)
+        filtro = getattr(user32, "ChangeWindowMessageFilterEx", None)
+        if filtro:                                    # Windows 7+: aceptar aunque haya otros permisos
+            for msg in (self.WM_DROPFILES, self.WM_COPYGLOBALDATA):
+                filtro(self.hwnd, msg, 1, None)
+        self._proc = proc_t(self._ventana)            # se guarda: si no, Python lo borra
+        self.viejo = set_long(self.hwnd, self.GWL_WNDPROC,
+                              ctypes.cast(self._proc, ctypes.c_void_p).value)
+
+    def _ventana(self, hwnd, msg, wparam, lparam):
+        if msg == self.WM_DROPFILES:
+            archivos = []
+            try:
+                n = self.shell32.DragQueryFileW(wparam, 0xFFFFFFFF, None, 0)
+                for i in range(n):
+                    largo = self.shell32.DragQueryFileW(wparam, i, None, 0)
+                    buf = self.ct.create_unicode_buffer(largo + 1)
+                    self.shell32.DragQueryFileW(wparam, i, buf, largo + 1)
+                    archivos.append(buf.value)
+            except Exception:
+                pass
+            finally:
+                self.shell32.DragFinish(wparam)
+            if archivos:
+                # NO se llama a Tkinter desde aquí (estamos dentro de su bucle de mensajes y
+                # lo corrompería): solo se deja en el buzón y el bucle de la app lo recoge.
+                self.buzon.append(archivos)
+            return 0
+        return self.llamar(self.viejo, hwnd, msg, wparam, lparam)
+
+    def recoger(self):
+        """Lista de lotes de archivos soltados desde la última vez."""
+        lotes, self.buzon = self.buzon, []
+        return lotes
 
 
 # ----------------------------------------------------------------------
@@ -1111,6 +1622,12 @@ class App:
         self.vu_t = time.time()
         self.vu_segs = []
         self.colores = {}
+        self.proximos = []
+        self.manual = False
+        self._nivelando = False
+        self.cola_nivelar = []
+        global FORMATO_12H
+        FORMATO_12H = self.db.cfg("formato_12h", "0") == "1"
 
         self.root = tk.Tk()
         self.root.title(NOMBRE)
@@ -1118,7 +1635,7 @@ class App:
             self.root.iconbitmap(recurso("icono.ico"))
         except Exception:
             pass
-        self.root.geometry("1120x680")
+        self.root.geometry("1200x680")
         self.root.minsize(900, 600)
         try:
             estilo = ttk.Style()
@@ -1143,15 +1660,18 @@ class App:
             raise
         if AudioUtilities is None:
             self.log("Aviso: pycaw no está instalado; no se bajará el volumen de otros programas.")
-        if not self.vol_win.disponible():
-            self.sc_vol.state(["disabled"])
-            self.lbl_vol.config(text="n/d")
-
+        self.rep.al_fallo = lambda a, motivo: self.marcar_problema(a["id"], motivo)
+        self.rep.al_exito = self._audio_sono
+        self.manual = self.db.cfg("modo_manual", "0") == "1"
         self.refrescar_categorias()
         self.refrescar_audios()
         self.cola_nivelar = []
         self.root.after(1500, self.programar_nivelacion)  # audios aún sin nivelar
         self.panel.bind("<Configure>", self.ajustar_divisor)
+        self.root.after(300, self.activar_soltar)
+        self.root.after(2000, self.verificar_archivos)
+        self.mostrar_manual()
+        self.root.after(30000, self.busqueda_automatica)
         self.t_audio = time.time()
         self.bucle_audio()
         self.animar()
@@ -1200,6 +1720,15 @@ class App:
         self.lbl_proximo = ttk.Label(top, text="", foreground="#1e64c8",
                                      font=("Segoe UI", 9, "bold"))
         self.lbl_proximo.pack(side="right")
+        self.lbl_actualiza = tk.Label(top, text="", fg="#c0392b", cursor="hand2",
+                                      font=("Segoe UI", 9, "bold"))
+        self.lbl_actualiza.bind("<Button-1>", lambda e: self.ofrecer_actualizacion())
+        self.nueva = None                      # (se muestra solo si hay versión nueva)
+        self.lbl_alerta = tk.Label(top, text="", fg="#c0392b", cursor="hand2",
+                                   font=("Segoe UI", 9, "bold"))
+        self.lbl_alerta.bind("<Button-1>", lambda e: self.ver_problemas())
+        self.lbl_manual = tk.Label(top, text="", fg="white", bg="#c0392b",
+                                   font=("Segoe UI", 9, "bold"), padx=8)
 
         # --- barra inferior (se empaqueta primero para que siempre se vea) ---
         barra = ttk.Frame(f)
@@ -1218,6 +1747,9 @@ class App:
         # controles de reproducción (derecha); solo símbolos que existen en Windows 7
         fc = ttk.Frame(barra)
         fc.pack(side="right")
+        self.btn_manual = ttk.Button(fc, text="Modo manual", width=23,
+                                     command=self.alternar_manual)
+        self.btn_manual.pack(side="left", padx=(3, 18))
         self.btn_pausa = ttk.Button(fc, text="❚❚  Pausa", width=12,
                                     command=self.pausar_reanudar)
         self.btn_pausa.pack(side="left", padx=3)
@@ -1235,9 +1767,9 @@ class App:
         panel.add(izq, weight=4)
         cols = ("nombre", "cat", "prio", "dias", "horario", "caduca", "estado")
         self.tree = ttk.Treeview(izq, columns=cols, show="headings", selectmode="browse")
-        for c, t, w in (("nombre", "Nombre", 205), ("cat", "Categoría", 85),
-                        ("prio", "Prioridad", 65), ("dias", "Días", 55),
-                        ("horario", "Horario", 190), ("caduca", "Caduca", 70),
+        for c, t, w in (("nombre", "Nombre", 175), ("cat", "Categoría", 80),
+                        ("prio", "Prioridad", 62), ("dias", "Días", 52),
+                        ("horario", "Horario", 235), ("caduca", "Caduca", 70),
                         ("estado", "Estado", 58)):
             self.tree.heading(c, text=t)
             self.tree.column(c, width=w, minwidth=40,
@@ -1249,6 +1781,10 @@ class App:
         self.tree.bind("<Double-1>", lambda e: self.editar_audio())
         self.tree.tag_configure("prio", font=FUENTE_PRIO)       # solo la prioridad usa esta letra
         self.tree.tag_configure("inactivo", foreground="#999999")
+        self.tree.tag_configure("problema", foreground="#c0392b")
+        self.lbl_arrastra = tk.Label(self.tree, text="Arrastra aquí tus audios\n(MP3, WAV, OGG o FLAC)",
+                                     fg="#9aa3ad", bg="white", font=("Segoe UI", 15),
+                                     justify="center")
 
         der = ttk.LabelFrame(panel, text="Cola de reproducción", padding=8)
         panel.add(der, weight=1)
@@ -1296,7 +1832,7 @@ class App:
         self.sc_vol.grid(row=1, column=0, sticky="ns", padx=10, pady=4)
         self.lbl_vol = ttk.Label(mezcla, text="--", justify="center", width=9, anchor="center")
         self.lbl_vol.grid(row=2, column=0)
-        ttk.Label(mezcla, text="Windows", foreground="#888888",
+        ttk.Label(mezcla, text="Mezclador", foreground="#888888",
                   font=("Segoe UI", 8)).grid(row=3, column=0)
         # fader 2: tope de decibelios de los audios
         ttk.Label(mezcla, text="TOPE", font=("Segoe UI", 8, "bold")).grid(row=0, column=1)
@@ -1311,18 +1847,22 @@ class App:
         self.lbl_tope.config(text="%.0f dB" % self.v_tope.get())
         self.sc_vol.bind("<ButtonPress-1>", lambda e: setattr(self, "_fader_arrastre", True),
                          add="+")
-        self.sc_vol.bind("<ButtonRelease-1>", lambda e: setattr(self, "_fader_arrastre", False),
-                         add="+")
+        self.sc_vol.bind("<ButtonRelease-1>", self._soltar_fader_volumen, add="+")
         self.sc_tope.bind("<ButtonRelease-1>", lambda e: self.db.set_cfg(
             "tope_db", "%.0f" % self.v_tope.get()), add="+")
 
         izqc = ttk.Frame(abajo)
         izqc.pack(side="left", fill="both", expand=True)
-        ttk.Label(izqc, text="Siguientes  (★ negrita = prioridad)",
+        ttk.Label(izqc, text="Próximos audios  (★ negrita = prioridad)",
                   foreground="#666666").pack(anchor="w")
-        self.lb_cola_main = ttk.Treeview(izqc, show="tree", selectmode="browse", height=6)
-        self.lb_cola_main.column("#0", width=150, stretch=True)
+        self.lb_cola_main = ttk.Treeview(izqc, columns=("hora", "audio"), show="headings",
+                                         selectmode="browse", height=6)
+        self.lb_cola_main.heading("hora", text="Hora")
+        self.lb_cola_main.heading("audio", text="Audio")
+        self.lb_cola_main.column("hora", width=84, minwidth=60, stretch=False, anchor="w")
+        self.lb_cola_main.column("audio", width=110, minwidth=60, stretch=True, anchor="w")
         self.lb_cola_main.tag_configure("prio", font=FUENTE_PRIO)
+        self.lb_cola_main.tag_configure("espera", foreground="#7a6a1f")
         self.lb_cola_main.pack(fill="both", expand=True, pady=(2, 0))
         self.lb_cola_main.bind("<ButtonPress-1>", self.cola_press)
         self.lb_cola_main.bind("<B1-Motion>", self.cola_drag)
@@ -1363,11 +1903,16 @@ class App:
         self.v_auto = tk.IntVar(value=1 if autoinicio_activo() else 0)
         ttk.Checkbutton(f, text="Iniciar con Windows (en segundo plano)",
                         variable=self.v_auto, command=self.cambiar_auto).pack(anchor="w", pady=4)
+        self.v_12h = tk.IntVar(value=1 if FORMATO_12H else 0)
+        ttk.Checkbutton(f, text="Mostrar las horas en formato de 12 horas (AM/PM)",
+                        variable=self.v_12h, command=self.cambiar_12h).pack(anchor="w", pady=2)
 
         fh = ttk.LabelFrame(f, text="Apertura automática a una hora (todos los días)", padding=8)
         fh.pack(fill="x", pady=8)
-        self.v_apertura = tk.StringVar(value=self.db.cfg("apertura", ""))
-        ttk.Label(fh, text="Hora (HH:MM):").pack(side="left")
+        self.v_apertura = tk.StringVar(value=fmt_hora(self.db.cfg("apertura", "")))
+        self.v_lbl_apertura = tk.StringVar()
+        ttk.Label(fh, textvariable=self.v_lbl_apertura).pack(side="left")
+        self._rotulo_apertura()
         ttk.Entry(fh, textvariable=self.v_apertura, width=8).pack(side="left", padx=6)
         ttk.Button(fh, text="Programar", command=self.programar_apertura).pack(side="left", padx=3)
         ttk.Button(fh, text="Quitar", command=self.quitar_apertura).pack(side="left", padx=3)
@@ -1412,6 +1957,12 @@ class App:
                     textvariable=self.v_techo).grid(row=1, column=1, padx=6, sticky="w")
         ttk.Button(fn, text="Guardar y reanalizar todos",
                    command=self.guardar_nivelacion).grid(row=1, column=2, padx=12)
+        self.v_recorte = tk.IntVar(value=int(self.db.cfg("recortar_silencio", "0")))
+        ttk.Checkbutton(fn, text="Recortar el silencio sobrante al inicio y al final de cada audio "
+                                 "(deja 0,3 s; se aplica al añadir o reanalizar)",
+                        variable=self.v_recorte, command=lambda: self.db.set_cfg(
+                            "recortar_silencio", str(self.v_recorte.get()))
+                        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 0))
         ttk.Label(fn, text="Cada audio se guarda al mismo nivel (%d dB) sin pasar del tope de "
                            "picos, y el fader TOPE de la pantalla principal\n"
                            "decide hasta qué nivel suenan, en vivo. El archivo original "
@@ -1419,16 +1970,26 @@ class App:
                   foreground="#666666", justify="left").grid(row=2, column=0, columnspan=4,
                                                              sticky="w", pady=(4, 0))
 
-        ttk.Button(f, text="Ver registro de eventos",
-                   command=self.ver_registro).pack(anchor="w", pady=(2, 0))
+        fr = ttk.Frame(f)
+        fr.pack(anchor="w", pady=(2, 0))
+        ttk.Button(fr, text="Ver registro de eventos", command=self.ver_registro).pack(side="left")
+        ttk.Button(fr, text="Revisar conflictos de programación",
+                   command=self.ver_conflictos).pack(side="left", padx=8)
 
         ttk.Label(f, text="Al cerrar la ventana (X) el programa sigue en segundo plano.\n"
                           "Para cerrarlo por completo: Alt+F4, este botón o el icono junto al reloj.",
                   justify="left").pack(anchor="w", pady=10)
         ttk.Button(f, text="Cerrar programa por completo",
                    command=lambda: self.salir(True)).pack(anchor="w")
-        ttk.Label(f, text="%s %s" % (NOMBRE, VERSION), foreground="#999999").pack(
-            anchor="w", pady=(14, 0))
+        fu = ttk.Frame(f)
+        fu.pack(anchor="w", pady=(14, 0))
+        ttk.Label(fu, text="%s %s" % (NOMBRE, VERSION), foreground="#666666").pack(side="left")
+        ttk.Button(fu, text="Buscar actualizaciones",
+                   command=lambda: self.comprobar_actualizacion(manual=True)).pack(
+            side="left", padx=10)
+        self.v_autoupd = tk.IntVar(value=int(self.db.cfg("auto_update", "1")))
+        ttk.Checkbutton(fu, text="Buscar automáticamente una vez al día", variable=self.v_autoupd,
+                        command=self.cambiar_auto_update).pack(side="left")
 
     # ---------------- registro / estado ----------------
     def log(self, msg):
@@ -1458,7 +2019,7 @@ class App:
         self.visor = VisorRegistro(self)
 
     def actualizar_estado(self):
-        est = self.rep.firma()
+        est = (self.rep.firma(), tuple((t, a["id"]) for t, a in self.proximos))
         if est == self.ultimo_estado:
             return
         self.ultimo_estado = est
@@ -1472,10 +2033,25 @@ class App:
         cola.delete(*cola.get_children())
         for cid, color in self.colores.items():
             cola.tag_configure("c%d" % cid, background=tinte(color))
-        for i, (txt, prio, cid) in enumerate(self.rep.cola_detalle()):
+        n = 0
+        # 1) lo que ya está en cola esperando su turno (ya le tocaba sonar)
+        for txt, prio, cid in self.rep.cola_detalle():
             tags = (["c%d" % cid] if cid in self.colores else []) + (["prio"] if prio else [])
-            cola.insert("", "end", iid=str(i), tags=tags,
-                        text="%d.  %s%s" % (i + 1, "★ " if prio else "", txt))
+            cola.insert("", "end", iid=str(n), tags=tags,
+                        values=("en cola", ("★ " if prio else "") + txt))
+            n += 1
+        # 2) lo que está programado para más adelante, con su hora
+        ahora = dt.datetime.now().replace(second=0, microsecond=0)
+        for t, a in self.proximos:
+            cid = a["categoria_id"]
+            tags = (["c%d" % cid] if cid in self.colores else []) + (
+                ["prio"] if a["prioridad"] else [])
+            dia = self._cuando(t, ahora)
+            hora = fmt_hora(t.strftime("%H:%M"))
+            cola.insert("", "end", iid=str(n), tags=tags, values=(
+                hora if dia == "hoy" else "%s %s" % (dia[:3] if dia != "mañana" else "mañ.", hora),
+                ("★ " if a["prioridad"] else "") + a["nombre"]))
+            n += 1
 
     @staticmethod
     def _mmss(seg):
@@ -1484,8 +2060,10 @@ class App:
 
     def actualizar_progreso(self):
         a, pos, dur, _ = self.rep.sonando()
-        if a is None or dur <= 0:
+        if a is None:
             frac, txt = 0.0, "0:00 / 0:00"
+        elif dur <= 0:                       # duración desconocida (audio muy largo): solo el tiempo
+            frac, txt = 0.0, self._mmss(pos)
         else:
             pos = min(pos, dur)
             frac = pos / dur
@@ -1609,7 +2187,7 @@ class App:
             return
         self.panel.unbind("<Configure>")
         try:
-            self.panel.sashpos(0, w - 340)
+            self.panel.sashpos(0, w - 390)
         except tk.TclError:
             pass
 
@@ -1666,24 +2244,28 @@ class App:
             self._redibujar_cola()
 
     # --- próximo audio programado ---
+    @staticmethod
+    def _cuando(t, base):
+        """'hoy', 'mañana' o el día de la semana, para un instante t."""
+        dias = (t.date() - base.date()).days
+        return "hoy" if dias == 0 else ("mañana" if dias == 1 else DIAS[t.weekday()])
+
     def calcular_proximo(self):
+        """Calcula los próximos audios programados (con su hora) para la cola y la
+        etiqueta de arriba. Mira hasta 4 días adelante y guarda hasta 15 emisiones."""
         base = dt.datetime.now().replace(second=0, microsecond=0)
         activos = self.db.q("SELECT * FROM audios WHERE activo=1")
-        if not activos:
-            self.lbl_proximo.config(text="")
+        self.proximos = proximas_emisiones(activos, base, 4 * 24 * 60, 15)
+        if not self.proximos:
+            self.lbl_proximo.config(text="" if not activos else
+                                    "Próximo: nada en los próximos 4 días")
             return
-        for n in range(1, 4 * 24 * 60):
-            t = base + dt.timedelta(minutes=n)
-            nombres = [a["nombre"] for a in activos if le_toca(a, t)]
-            if nombres:
-                cuando = "hoy" if t.date() == base.date() else (
-                    "mañana" if (t.date() - base.date()).days == 1
-                    else DIAS[t.weekday()])
-                extra = " (+%d)" % (len(nombres) - 1) if len(nombres) > 1 else ""
-                self.lbl_proximo.config(text="Próximo: %s %s – %s%s" % (
-                    cuando, t.strftime("%H:%M"), nombres[0][:32], extra))
-                return
-        self.lbl_proximo.config(text="Próximo: nada en los próximos 4 días")
+        t0 = self.proximos[0][0]
+        mismos = [a for t, a in self.proximos if t == t0]
+        extra = " (+%d)" % (len(mismos) - 1) if len(mismos) > 1 else ""
+        self.lbl_proximo.config(text="Próximo: %s %s – %s%s%s" % (
+            self._cuando(t0, base), fmt_hora(t0.strftime("%H:%M")), mismos[0]["nombre"][:26],
+            extra, "  (detenido)" if self.manual else ""))
 
     def pausar_reanudar(self):
         self.rep.pausar_reanudar()
@@ -1693,9 +2275,13 @@ class App:
         self.rep.vaciar_cola()
         self.ultimo_estado = None
 
-    # --- fader VOLUMEN: volumen maestro de Windows (la salida del equipo) ---
+    # --- fader VOLUMEN: el volumen propio de Audiomático en el Mezclador de Windows ---
     def _txt_vol(self, pct, db):
         return "%d%%\n%s" % (pct, "silencio" if pct <= 0 else "%.1f dB" % db)
+
+    def _soltar_fader_volumen(self, e=None):
+        self._fader_arrastre = False
+        self.db.set_cfg("volumen_app", "%.0f" % self.v_vol.get())   # se recuerda entre aperturas
 
     def cambiar_volumen(self, valor):
         pct = float(valor)
@@ -1704,10 +2290,21 @@ class App:
             pct, 20.0 * math.log10(pct / 100.0) if pct > 0 else -99.0))
 
     def sincronizar_volumen_windows(self):
-        """Mantiene el fader igual al volumen de Windows (por si lo cambian desde fuera)."""
-        if self.vol_win.disponible() and not self._fader_arrastre:
-            v = self.vol_win.leer()
-            if v is not None:
+        """Mantiene el fader igual al control de Audiomático en el Mezclador de Windows
+        (por si lo mueven desde allí). La sesión aparece cuando el programa abre el audio."""
+        v = self.vol_win.leer()
+        if v is None:
+            self.sc_vol.state(["disabled"])
+            self.lbl_vol.config(text="buscando…")
+        else:
+            self.sc_vol.state(["!disabled"])
+            if not getattr(self, "_vol_aplicado", False):
+                self._vol_aplicado = True       # primera vez: se recupera el volumen guardado
+                guardado = self.db.cfg("volumen_app", "")
+                if guardado:
+                    self.vol_win.poner(float(guardado))
+                    v = self.vol_win.leer() or v
+            if not self._fader_arrastre:
                 self.v_vol.set(v[0])
                 self.lbl_vol.config(text=self._txt_vol(v[0], v[1]))
         self.root.after(1000, self.sincronizar_volumen_windows)
@@ -1759,6 +2356,10 @@ class App:
             self.rep.paso(dt_)
         except Exception as e:
             self.log("Error en el reproductor: %s" % e)
+        soltar = getattr(self, "soltar", None)
+        if soltar is not None and soltar.buzon:
+            for lote in soltar.recoger():
+                self.al_soltar(lote)
         self.root.after(40, self.bucle_audio)
 
     # ---------------- audios ----------------
@@ -1785,13 +2386,14 @@ class App:
             txt_dias = "Todos" if len(dias) == 7 else ", ".join(DIAS[d] for d in dias)
             partes = []
             if a["horas"]:
-                partes.append(a["horas"].replace(",", " "))
+                partes.append(fmt_horas(a["horas"]))
             if a["minutos"]:
-                partes.append("min %s (%d-%dh)" % (
-                    a["minutos"].replace(",", "/"), a["hora_desde"], a["hora_hasta"]))
+                partes.append("min %s (%s-%s%s)" % (
+                    a["minutos"].replace(",", "/"), fmt_h(a["hora_desde"]),
+                    fmt_h(a["hora_hasta"]), "" if FORMATO_12H else "h"))
             if a["intervalo"]:
                 partes.append("cada %d min %s-%s" % (
-                    a["intervalo"], a["int_desde"], a["int_hasta"]))
+                    a["intervalo"], fmt_hora(a["int_desde"]), fmt_hora(a["int_hasta"])))
             tags = []
             if a["categoria_id"] in self.colores:
                 tags.append("c%d" % a["categoria_id"])
@@ -1799,10 +2401,16 @@ class App:
                 tags.append("prio")
             if not a["activo"]:
                 tags.append("inactivo")
+            if a["problema"]:
+                tags.append("problema")
             self.tree.insert("", "end", iid=str(a["id"]), tags=tags, values=(
                 a["nombre"], a["cat"] or "-", "★ SI" if a["prioridad"] else "",
                 txt_dias, " | ".join(partes), a["fecha_fin"] or "Indefinido",
-                "Activo" if a["activo"] else "Inactivo"))
+                "⚠ Error" if a["problema"] else ("Activo" if a["activo"] else "Inactivo")))
+        if self.db.q("SELECT 1 FROM audios LIMIT 1"):
+            self.lbl_arrastra.place_forget()
+        else:                                    # lista vacía: indica que se puede arrastrar
+            self.lbl_arrastra.place(relx=0.5, rely=0.42, anchor="center")
 
     # ---------------- nivelación de volumen ----------------
     def cfg_norm(self):
@@ -1834,22 +2442,35 @@ class App:
         self._borrar_norm(a)
         destino = os.path.join(CARPETA_AUDIOS, "n_%d_%d.wav" % (aid, int(time.time() * 1000)))
         try:
-            nivel, g = nivelar_archivo(a["ruta"], destino, obj, techo)
-        except Exception as e:
-            self.log("No se pudo nivelar '%s': %s" % (a["nombre"], e))
-            self.db.x("UPDATE audios SET ruta_norm='',nivel_db=NULL,ganancia_db=NULL,"
-                      "objetivo_db=? WHERE id=?", (obj, aid))
+            nivel, g, dur, quitado = nivelar_archivo(
+                a["ruta"], destino, obj, techo, self.db.cfg("recortar_silencio", "0") == "1")
+        except Exception as e:            # incluye MemoryError (su texto viene vacío)
+            motivo = motivo_error(e)
+            self.log("No se pudo nivelar '%s' (suena igual, sin nivelar): %s" % (a["nombre"], motivo))
+            if os.path.exists(destino):
+                os.remove(destino)
+            # nivel_db=-99 marca "no analizable": no se reintenta en cada arranque
+            self.db.x("UPDATE audios SET ruta_norm='',nivel_db=-99,ganancia_db=0,"
+                      "objetivo_db=?,duracion=? WHERE id=?",
+                      (obj, duracion_estimada(a["ruta"]), aid))
+            if not motivo.startswith("es muy largo"):     # un audio largo suena bien, solo sin nivelar
+                self.marcar_problema(aid, motivo)
             return
-        self.db.x("UPDATE audios SET ruta_norm=?,nivel_db=?,ganancia_db=?,objetivo_db=? "
-                  "WHERE id=?", (destino if g else "", nivel, g, obj, aid))
-        self.log("Nivelado '%s': %.1f dB -> %.1f dB (ajuste %+.1f dB)"
-                 % (a["nombre"], nivel, nivel + g, g))
+        self.db.x("UPDATE audios SET ruta_norm=?,nivel_db=?,ganancia_db=?,objetivo_db=?,duracion=? "
+                  "WHERE id=?", (destino, nivel, g, obj, dur, aid))
+        self.log("Nivelado '%s': %.1f dB -> %.1f dB (ajuste %+.1f dB)%s"
+                 % (a["nombre"], nivel, nivel + g, g,
+                    "; recortados %.1f s de silencio" % quitado if quitado else ""))
+        if a["problema"]:
+            self.limpiar_problema(aid)
 
     def nivelar_pendientes(self):
         """Nivela de a un audio por vez para no congelar la ventana."""
         if not self.cola_nivelar:
+            self._nivelando = False
             self.refrescar_audios(False)
             return
+        self._nivelando = True
         self.nivelar_audio(self.cola_nivelar.pop(0))
         self.root.after(50, self.nivelar_pendientes)
 
@@ -1867,8 +2488,11 @@ class App:
                 "OR objetivo_db<>?", (obj,))]
         if forzar:
             self.db.x("UPDATE audios SET objetivo_db=NULL")
-        self.cola_nivelar = ids
-        self.nivelar_pendientes()
+        # sin repetir: solo se añaden los que aún no están en la cola, y no se abre
+        # una segunda cadena de trabajo si ya hay una en marcha
+        self.cola_nivelar += [i for i in ids if i not in self.cola_nivelar]
+        if not self._nivelando:
+            self.nivelar_pendientes()
 
     def guardar_nivelacion(self):
         try:
@@ -1894,8 +2518,258 @@ class App:
             return None
         return self.db.q("SELECT * FROM audios WHERE id=?", (int(s[0]),))[0]
 
-    def nuevo_audio(self):
-        DialogoAudio(self)
+    def nuevo_audio(self, archivo=None):
+        DialogoAudio(self, archivo=archivo)
+
+    # --- arrastrar archivos a la ventana ---
+    def activar_soltar(self):
+        try:
+            self.soltar = SoltarArchivos(self.root, self.al_soltar)
+        except Exception as e:
+            self.soltar = None
+            self.log("Aviso: no se pudo activar arrastrar y soltar (%s: %s)." % (
+                type(e).__name__, e))
+
+    def al_soltar(self, rutas):
+        """Archivos o carpetas soltados sobre la ventana: abre 'Añadir audio' para cada uno."""
+        audios, ignorados = [], 0
+        for r in rutas:
+            if os.path.isdir(r):
+                for carpeta, _, nombres in os.walk(r):
+                    for n in sorted(nombres):
+                        if n.lower().endswith(EXTENSIONES):
+                            audios.append(os.path.join(carpeta, n))
+            elif r.lower().endswith(EXTENSIONES):
+                audios.append(r)
+            else:
+                ignorados += 1
+        vistos = []
+        for a in audios:                         # sin repetir el mismo archivo soltado dos veces
+            if os.path.normcase(a) not in [os.path.normcase(v) for v in vistos]:
+                vistos.append(a)
+        if ignorados or not vistos:
+            messagebox.showinfo("Arrastrar audios",
+                                ("Se ignoraron %d archivo(s). " % ignorados if ignorados else "")
+                                + ("Solo se aceptan MP3, WAV, OGG o FLAC." if not vistos else ""),
+                                parent=self.root)
+        self.mostrar()
+        self.pend_altas = getattr(self, "pend_altas", []) + vistos
+        self._siguiente_alta()
+
+    def _siguiente_alta(self):
+        if getattr(self, "dlg_alta", None) is not None or not getattr(self, "pend_altas", None):
+            return
+        archivo = self.pend_altas.pop(0)
+        dlg = DialogoAudio(self, archivo=archivo)
+        self.dlg_alta = dlg
+
+        def cerrado(e):
+            if e.widget is dlg:
+                self.dlg_alta = None
+                self.root.after(150, self._siguiente_alta)
+        dlg.bind("<Destroy>", cerrado)
+
+    def buscar_duplicado(self, ruta, nombre, excluir=None):
+        """(aviso o None, huella). Detecta el mismo archivo o el mismo nombre."""
+        try:
+            h = huella_archivo(ruta)
+        except OSError:
+            h = ""
+        for a in self.db.q("SELECT id, nombre, ruta, huella FROM audios"):
+            if a["id"] == excluir:
+                continue
+            if h:
+                ha = a["huella"]
+                if not ha:                       # audios antiguos: se calcula y se guarda
+                    try:
+                        ha = huella_archivo(a["ruta"])
+                        self.db.x("UPDATE audios SET huella=? WHERE id=?", (ha, a["id"]))
+                    except OSError:
+                        ha = ""
+                if ha == h:
+                    return "Este archivo es idéntico al del audio «%s»." % a["nombre"], h
+            if a["nombre"].strip().lower() == nombre.strip().lower():
+                return "Ya existe un audio llamado «%s»." % a["nombre"], h
+        return None, h
+
+    # --- audios con problemas (archivo que falta, que no se puede leer o no suena) ---
+    MSG_FALTA = "falta el archivo de audio"
+
+    def marcar_problema(self, aid, motivo):
+        self.db.x("UPDATE audios SET problema=? WHERE id=?", (motivo[:300], aid))
+        self.refrescar_audios(False)
+        self.actualizar_alerta()
+
+    def limpiar_problema(self, aid):
+        self.db.x("UPDATE audios SET problema='' WHERE id=?", (aid,))
+        self.refrescar_audios(False)
+        self.actualizar_alerta()
+
+    def _audio_sono(self, a):
+        """Un audio empezó a sonar bien: si tenía un aviso de problema, se quita."""
+        r = self.db.q("SELECT problema FROM audios WHERE id=?", (a["id"],))
+        if r and r[0]["problema"]:
+            self.limpiar_problema(a["id"])
+
+    def verificar_archivos(self):
+        """Marca los audios cuyo archivo ya no existe (y quita la marca si reaparece)."""
+        cambio = False
+        for a in self.db.q("SELECT id, ruta, ruta_norm, problema FROM audios"):
+            existe = os.path.exists(a["ruta"]) or bool(a["ruta_norm"] and
+                                                       os.path.exists(a["ruta_norm"]))
+            if not existe and a["problema"] != self.MSG_FALTA:
+                self.db.x("UPDATE audios SET problema=? WHERE id=?", (self.MSG_FALTA, a["id"]))
+                self.log("Aviso: falta el archivo del audio #%d." % a["id"])
+                cambio = True
+            elif existe and a["problema"] == self.MSG_FALTA:
+                self.db.x("UPDATE audios SET problema='' WHERE id=?", (a["id"],))
+                cambio = True
+        if cambio:
+            self.refrescar_audios(False)
+        self.actualizar_alerta()
+        self.root.after(3600 * 1000, self.verificar_archivos)       # y cada hora
+
+    def actualizar_alerta(self):
+        n = len(self.db.q("SELECT 1 FROM audios WHERE problema<>''"))
+        if n:
+            self.lbl_alerta.config(text="⚠ %d con problemas · Ver" % n)
+            self.lbl_alerta.pack(side="right", padx=(0, 14))
+        else:
+            self.lbl_alerta.pack_forget()
+
+    def ver_problemas(self):
+        filas = self.db.q("SELECT id, nombre, problema FROM audios WHERE problema<>'' "
+                          "ORDER BY nombre")
+        v = tk.Toplevel(self.root)
+        v.title("Audios con problemas")
+        v.geometry("720x320")
+        v.transient(self.root)
+        f = ttk.Frame(v, padding=8)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text="Estos audios no se pudieron leer o ya no existen. El aviso se quita "
+                          "solo cuando el audio vuelve a sonar bien.",
+                  wraplength=690, foreground="#555555").pack(anchor="w", pady=(0, 6))
+        t = ttk.Treeview(f, columns=("a", "m"), show="headings", height=8)
+        t.heading("a", text="Audio")
+        t.heading("m", text="Motivo")
+        t.column("a", width=200)
+        t.column("m", width=480)
+        for r in filas:
+            t.insert("", "end", iid=str(r["id"]), values=(r["nombre"], r["problema"]))
+        t.pack(fill="both", expand=True)
+
+        def quitar():
+            for r in filas:
+                self.db.x("UPDATE audios SET problema='' WHERE id=?", (r["id"],))
+            self.refrescar_audios(False)
+            self.actualizar_alerta()
+            v.destroy()
+        bt = ttk.Frame(f)
+        bt.pack(fill="x", pady=(8, 0))
+        ttk.Button(bt, text="Quitar los avisos", command=quitar).pack(side="left")
+        ttk.Button(bt, text="Cerrar", command=v.destroy).pack(side="right")
+
+    # --- modo manual: detiene la programación sin cerrar el programa ---
+    def alternar_manual(self):
+        if not self.manual and not messagebox.askyesno(
+                "Modo manual", "Los audios programados NO sonarán hasta que vuelvas a activar "
+                "la programación.\n\n¿Pasar a modo manual?", default="no", parent=self.root):
+            return
+        self.manual = not self.manual
+        self.db.set_cfg("modo_manual", "1" if self.manual else "0")
+        self.log("Modo manual %s." % ("ACTIVADO: programación detenida" if self.manual
+                                      else "desactivado: programación activa"))
+        self.mostrar_manual()
+        self.calcular_proximo()
+
+    def mostrar_manual(self):
+        if self.manual:
+            self.btn_manual.config(text="Reanudar programación")
+            self.lbl_manual.config(text="MODO MANUAL")
+            self.lbl_manual.pack(side="right", padx=(0, 14))
+        else:
+            self.btn_manual.config(text="Modo manual")
+            self.lbl_manual.pack_forget()
+
+    # --- conflictos de programación ---
+    def conflictos(self, dias=7):
+        """[(ids de audios implicados, texto)] con los choques de la programación."""
+        base = dt.datetime.now().replace(second=0, microsecond=0)
+        audios = self.db.q("SELECT * FROM audios WHERE activo=1")
+        dur = {a["id"]: (a["duracion"] or duracion_estimada(a["ruta"])) for a in audios}
+        ems = proximas_emisiones(audios, base, dias * 1440, 20000)
+        res, vistos = [], set()
+
+        def unico(clave):
+            if clave in vistos:
+                return False
+            vistos.add(clave)
+            return True
+
+        def cuando(t):
+            return "%s %s" % (self._cuando(t, base).capitalize(), fmt_hora(t.strftime("%H:%M")))
+
+        # 1) dos audios del mismo tipo en el mismo minuto
+        por_min = {}
+        for t, a in ems:
+            por_min.setdefault((t, bool(a["prioridad"])), []).append(a)
+        for (t, prio), lista in sorted(por_min.items()):
+            if len(lista) > 1:
+                ids = tuple(sorted(a["id"] for a in lista))
+                if unico(("mismo", ids)):
+                    nombres = " y ".join("«%s»" % a["nombre"] for a in lista)
+                    res.append((set(ids), "%s: %s caen en el mismo minuto; uno esperará en la "
+                                          "cola." % (cuando(t), nombres)))
+        # 2) un audio dura más que el tiempo hasta su siguiente repetición
+        ult = {}
+        for t, a in ems:
+            if a["id"] in ult and a["id"] in dur:
+                gap = (t - ult[a["id"]]).total_seconds()
+                if 0 < gap < dur[a["id"]] and unico(("solo", a["id"])):
+                    res.append(({a["id"]}, "«%s» dura %s pero se repite cada %s: se solaparía "
+                                           "consigo mismo." % (a["nombre"], self._mmss(dur[a["id"]]),
+                                                               self._mmss(gap))))
+            ult[a["id"]] = t
+        # 3) un audio normal empieza tarde porque el anterior todavía no terminó
+        fin_prev, prev = None, None
+        for t, a in sorted((x for x in ems if not x[1]["prioridad"]), key=lambda x: x[0]):
+            if prev is not None and fin_prev and t < fin_prev and prev["id"] != a["id"]:
+                if unico(("tarde", prev["id"], a["id"])):
+                    res.append(({prev["id"], a["id"]},
+                                "%s: «%s» empezará tarde porque «%s» dura %s y no habrá terminado."
+                                % (cuando(t), a["nombre"], prev["nombre"], self._mmss(dur[prev["id"]]))))
+            ini = max(t, fin_prev) if fin_prev else t
+            fin_prev, prev = ini + dt.timedelta(seconds=dur.get(a["id"], 0)), a
+        return res
+
+    def ver_conflictos(self):
+        res = self.conflictos()
+        v = tk.Toplevel(self.root)
+        v.title("Revisión de la programación")
+        v.geometry("760x360")
+        v.transient(self.root)
+        f = ttk.Frame(v, padding=8)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text="Revisión de los próximos 7 días (solo audios activos).",
+                  foreground="#555555").pack(anchor="w", pady=(0, 6))
+        t = tk.Text(f, wrap="word", font=("Segoe UI", 10), height=12)
+        sb = ttk.Scrollbar(f, orient="vertical", command=t.yview)
+        t.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        t.pack(fill="both", expand=True)
+        if res:
+            t.insert("end", "Se encontraron %d aviso(s):\n\n" % len(res))
+            for _, txt in res[:60]:
+                t.insert("end", "• %s\n\n" % txt)
+        else:
+            t.insert("end", "No se encontraron conflictos: ningún audio se pisa con otro.")
+        t.config(state="disabled")
+        ttk.Button(v, text="Cerrar", command=v.destroy).pack(pady=(0, 8))
+
+    @staticmethod
+    def _mmss(seg):
+        seg = int(round(seg))
+        return "%d:%02d" % (seg // 60, seg % 60)
 
     def editar_audio(self):
         a = self.sel_audio()
@@ -2004,18 +2878,158 @@ class App:
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
+    # ---------------- actualizaciones (GitHub Releases) ----------------
+    def comprobar_actualizacion(self, manual=False):
+        """Busca en segundo plano (la ventana no se congela) y avisa en el hilo principal."""
+        if getattr(self, "_buscando", False):
+            return
+        self._buscando = True
+        resultado = {}
+
+        def trabajo():
+            try:
+                resultado["info"] = buscar_actualizacion()
+            except Exception as e:
+                resultado["error"] = "%s: %s" % (type(e).__name__, e)
+
+        threading.Thread(target=trabajo, daemon=True).start()
+
+        def esperar():
+            if not resultado:
+                self.root.after(300, esperar)
+                return
+            self._buscando = False
+            if "error" in resultado:
+                self.log("No se pudo buscar actualizaciones: " + resultado["error"])
+                if manual:
+                    messagebox.showwarning(
+                        "Actualizaciones", "No se pudo comprobar si hay versiones nuevas.\n"
+                        "Revisa la conexión a Internet.\n\n" + resultado["error"],
+                        parent=self.root)
+                return
+            self.db.set_cfg("ultima_busqueda", dt.date.today().isoformat())
+            info = resultado["info"]
+            if info is None:
+                self.nueva = None
+                self.lbl_actualiza.pack_forget()
+                if manual:
+                    messagebox.showinfo("Actualizaciones", "Ya tienes la última versión (%s)."
+                                        % VERSION, parent=self.root)
+                return
+            self.nueva = info
+            self.log("Hay una versión nueva disponible: %s" % info["version"])
+            self.lbl_actualiza.config(text="⬆ Nueva versión %s · Actualizar" % info["version"])
+            self.lbl_actualiza.pack(side="right", padx=(0, 14))
+            if manual:
+                self.ofrecer_actualizacion()
+        esperar()
+
+    def busqueda_automatica(self):
+        """Una vez al día, como máximo, y solo si está activada en Sistema."""
+        if (self.db.cfg("auto_update", "1") == "1"
+                and self.db.cfg("ultima_busqueda", "") != dt.date.today().isoformat()):
+            self.comprobar_actualizacion(manual=False)
+        self.root.after(6 * 3600 * 1000, self.busqueda_automatica)
+
+    def ofrecer_actualizacion(self):
+        info = getattr(self, "nueva", None)
+        if not info:
+            return
+        if not info["instalador"] or not info["sha256"]:
+            if messagebox.askyesno(
+                    "Nueva versión %s" % info["version"],
+                    "Hay una versión nueva, pero no se puede instalar automáticamente.\n"
+                    "¿Abrir la página de descarga?", parent=self.root):
+                webbrowser.open(info["pagina"])
+            return
+        notas = info["notas"][:500] + ("…" if len(info["notas"]) > 500 else "")
+        if not messagebox.askyesno(
+                "Nueva versión %s" % info["version"],
+                "Tienes la versión %s y hay una nueva: %s.\n\n%s\n\n"
+                "Se descargará e instalará ahora. El programa se cerrará y se volverá a abrir "
+                "solo; mientras tanto no sonarán los audios programados.\n\n¿Actualizar?"
+                % (VERSION, info["version"], notas), parent=self.root):
+            return
+        self.descargar_e_instalar(info)
+
+    def descargar_e_instalar(self, info):
+        carpeta = os.path.join(tempfile.gettempdir(), "Audiomatico_actualizacion")
+        os.makedirs(carpeta, exist_ok=True)
+        destino = os.path.join(carpeta, "Instalar_Audiomatico_%s.exe" % info["version"])
+        ventana = tk.Toplevel(self.root)
+        ventana.title("Descargando la actualización")
+        ventana.transient(self.root)
+        ventana.resizable(False, False)
+        ventana.protocol("WM_DELETE_WINDOW", lambda: None)
+        ventana.grab_set()
+        ttk.Label(ventana, text="Descargando la versión %s…" % info["version"],
+                  padding=(16, 14, 16, 4)).pack()
+        barra = ttk.Progressbar(ventana, length=320, maximum=100)
+        barra.pack(padx=16, pady=(0, 14))
+        estado = {"hecho": 0, "total": 0}
+        resultado = {}
+
+        def trabajo():
+            try:
+                descargar_verificado(info["instalador"], destino, info["sha256"],
+                                     lambda h, t: estado.update(hecho=h, total=t))
+                resultado["ok"] = True
+            except Exception as e:
+                resultado["error"] = "%s: %s" % (type(e).__name__, e)
+
+        threading.Thread(target=trabajo, daemon=True).start()
+
+        def esperar():
+            if estado["total"]:
+                barra["value"] = estado["hecho"] * 100.0 / estado["total"]
+            if not resultado:
+                self.root.after(150, esperar)
+                return
+            ventana.destroy()
+            if "error" in resultado:
+                self.log("Falló la descarga de la actualización: " + resultado["error"])
+                messagebox.showerror("Actualización", "No se pudo descargar la actualización.\n\n"
+                                     + resultado["error"], parent=self.root)
+                return
+            self.log("Instalando la versión %s…" % info["version"])
+            import ctypes     # el instalador pide permisos de administrador (ShellExecute los gestiona)
+            r = ctypes.windll.shell32.ShellExecuteW(
+                None, "open", destino, "/SILENT /CLOSEAPPLICATIONS", None, 1)
+            if r <= 32:
+                messagebox.showerror("Actualización", "No se pudo iniciar el instalador "
+                                     "(código %d).\nEstá en:\n%s" % (r, destino), parent=self.root)
+                return
+            self.root.after(1500, lambda: self.salir(False))   # el instalador lo vuelve a abrir
+        esperar()
+
+    def cambiar_auto_update(self):
+        self.db.set_cfg("auto_update", str(self.v_autoupd.get()))
+
+    def _rotulo_apertura(self):
+        self.v_lbl_apertura.set("Hora (%s):" % ("ej. 7:30 AM" if FORMATO_12H else "HH:MM"))
+
+    def cambiar_12h(self):
+        global FORMATO_12H
+        FORMATO_12H = bool(self.v_12h.get())
+        self.db.set_cfg("formato_12h", "1" if FORMATO_12H else "0")
+        self._rotulo_apertura()
+        self.v_apertura.set(fmt_hora(self.db.cfg("apertura", "")))
+        self.refrescar_audios()          # también actualiza "Próximo: ..."
+
     def programar_apertura(self):
         try:
-            h, m = self.v_apertura.get().strip().split(":")
-            hhmm = "%02d:%02d" % (int(h), int(m))
-            assert 0 <= int(h) <= 23 and 0 <= int(m) <= 59
-        except Exception:
-            messagebox.showwarning("Formato", "Escribe la hora como HH:MM (ej. 07:30).")
+            h, m = parse_hora(self.v_apertura.get())
+            hhmm = "%02d:%02d" % (h, m)
+        except ValueError:
+            messagebox.showwarning("Formato", "Escribe la hora como %s." % (
+                "7:30 AM" if FORMATO_12H else "HH:MM (ej. 07:30)"))
             return
         ok, salida = tarea_programada(hhmm)
         if ok:
             self.db.set_cfg("apertura", hhmm)
-            messagebox.showinfo("Listo", "El programa se abrirá todos los días a las %s." % hhmm)
+            self.v_apertura.set(fmt_hora(hhmm))
+            messagebox.showinfo("Listo", "El programa se abrirá todos los días a las %s."
+                                % fmt_hora(hhmm))
         else:
             messagebox.showerror("No se pudo programar", salida)
 
@@ -2117,8 +3131,9 @@ class App:
         if clave != self.ultimo_minuto:
             self.ultimo_minuto = clave
             self.calcular_proximo()
-            toca = [a for a in self.db.q("SELECT * FROM audios WHERE activo=1")
-                    if le_toca(a, ahora)]
+            toca = [] if self.manual else [      # en modo manual no suena nada programado
+                a for a in self.db.q("SELECT * FROM audios WHERE activo=1")
+                if le_toca(a, ahora)]
             toca.sort(key=lambda a: -a["prioridad"])  # primero los de prioridad
             for a in toca:
                 self.rep.agregar(a)

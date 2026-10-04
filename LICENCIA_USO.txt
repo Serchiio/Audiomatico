@@ -1,0 +1,26 @@
+﻿LICENCIA DE USO DE AUDIOMÁTICO
+
+Lea este acuerdo antes de instalar. Al instalar o usar Audiomático usted acepta estas condiciones.
+
+1. Uso permitido
+   Puede instalar y usar el programa en los equipos que usted controle, para uso personal o dentro de su negocio u organización.
+
+2. Lo que no está permitido
+   - Copiar o distribuir el programa o el instalador a terceros, ni venderlo, alquilarlo o sublicenciarlo.
+   - Modificar el programa, descompilarlo o intentar obtener su código fuente, salvo que la ley lo permita expresamente.
+   - Quitar los avisos de autoría del programa.
+
+3. Código fuente
+   El código fuente publicado en el repositorio se rige por su propia licencia (PolyForm Strict 1.0.0, archivo LICENSE). Esta licencia de uso solo cubre el programa instalado.
+
+4. Sus datos
+   Audiomático guarda sus audios, su programación y su configuración únicamente en su equipo (carpeta ProgramadorAudios dentro de AppData). El programa no envía esa información a ningún servidor. Desinstalar el programa no borra esos datos.
+
+5. Sin garantía
+   El programa se entrega "tal cual", sin garantía de ningún tipo. El autor no se hace responsable de pérdidas o daños derivados de su uso, incluidos audios que no suenen a la hora prevista. Pruebe su programación antes de depender de ella.
+
+6. Derechos de terceros
+   Usted es responsable de contar con los derechos de uso y de emisión de los audios que programe (por ejemplo, música y publicidad).
+
+7. Terminación
+   Esta licencia termina si incumple estas condiciones. En ese caso debe dejar de usar el programa y eliminar sus copias.

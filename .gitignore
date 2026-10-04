@@ -1,0 +1,21 @@
+# Entornos de Python (se recrean con compilar.bat)
+.venv32/
+.venv64/
+.venv/
+
+# Resultado de compilar
+build/
+dist/
+instalador/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# Datos del usuario y pruebas locales (el programa guarda sus datos en %APPDATA%)
+*.db
+registro.txt
+registro.txt.1
+audios/
+zz_test/
