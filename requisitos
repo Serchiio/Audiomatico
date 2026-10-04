@@ -1,6 +1,0 @@
-pygame==2.1.2
-pycaw==20220416
-comtypes==1.1.14
-pystray==0.19.4
-Pillow==9.5.0
-psutil==5.9.8

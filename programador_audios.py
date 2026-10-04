@@ -1069,6 +1069,20 @@ class Reproductor:
         self.cola_prio.clear()
         self.espera_hasta = 0.0
 
+    def quitar_audio(self, aid):
+        """Un audio se eliminó: sale de las colas y, si suena ahora, se detiene."""
+        self.cola[:] = [x for x in self.cola if x["id"] != aid]
+        self.cola_prio[:] = [x for x in self.cola_prio if x["id"] != aid]
+        if self.prio_actual is not None and self.prio_actual["id"] == aid:
+            self.detener_actual()
+        if self.actual is not None and self.actual["id"] == aid:
+            self.detener_actual()
+        if self.actual is None:             # suelta el archivo para poder borrarlo (Windows lo bloquea)
+            try:
+                pygame.mixer.music.unload()
+            except Exception:
+                pass
+
     def mover_cola(self, i, j):
         """Mueve el elemento i de la cola a la posición j."""
         if 0 <= i < len(self.cola) and 0 <= j < len(self.cola) and i != j:
@@ -1474,6 +1488,10 @@ class DialogoAudio(tk.Toplevel):
                  datos + (self.audio["id"],))
             aid = self.audio["id"]
             cambio = ruta != self.audio["ruta"]
+            if cambio:      # archivo nuevo: se olvidan los datos y se borran las copias del anterior
+                db.x("UPDATE audios SET ruta_norm='',nivel_db=NULL,ganancia_db=NULL,"
+                     "objetivo_db=NULL,duracion=NULL,problema='',huella='' WHERE id=?", (aid,))
+                self.app.borrar_archivos_audio(self.audio, conservar=(ruta,))
         else:
             aid = db.x("INSERT INTO audios(nombre,ruta,categoria_id,prioridad,activo,dias,horas,"
                        "minutos,hora_desde,hora_hasta,fecha_fin,intervalo,int_desde,int_hasta,"
@@ -1482,26 +1500,32 @@ class DialogoAudio(tk.Toplevel):
             cambio = True
         if huella:
             db.x("UPDATE audios SET huella=? WHERE id=?", (huella, aid))
-        if cambio:
-            self.config(cursor="watch")
-            self.update_idletasks()
-        self.app.nivelar_audio(aid, forzar=cambio)
-        self.app.refrescar_audios()
-        # avisos útiles al guardar: problemas con el archivo y choques de programación
-        avisos = []
-        r = db.q("SELECT problema FROM audios WHERE id=?", (aid,))
-        if r and r[0]["problema"]:
-            avisos.append("No se pudo analizar este audio: %s\nPuede que suene igual; pruébalo "
-                          "con «Probar ahora»." % r[0]["problema"])
-        conf = [txt for ids, txt in self.app.conflictos() if aid in ids]
-        if conf:
-            avisos.append("Conflictos de programación:\n" + "\n".join("• " + c for c in conf[:4])
-                          + ("\n(y %d más; mira Sistema → Revisar conflictos)" % (len(conf) - 4)
-                             if len(conf) > 4 else ""))
-        if avisos:
-            self.config(cursor="")
-            messagebox.showwarning("Revisa este audio", "\n\n".join(avisos), parent=self)
-        self.destroy()
+        # Desde aquí el audio ya está guardado: pase lo que pase la ventana se cierra, así no
+        # se queda abierta con el botón Guardar listo para crear el mismo audio otra vez.
+        try:
+            if cambio:
+                self.config(cursor="watch")
+                self.update_idletasks()
+            self.app.nivelar_audio(aid, forzar=cambio)
+            self.app.refrescar_audios()
+            # avisos útiles al guardar: problemas con el archivo y choques de programación
+            avisos = []
+            r = db.q("SELECT problema FROM audios WHERE id=?", (aid,))
+            if r and r[0]["problema"]:
+                avisos.append("No se pudo analizar este audio: %s\nPuede que suene igual; "
+                              "pruébalo con «Probar ahora»." % r[0]["problema"])
+            conf = [txt for ids, txt in self.app.conflictos() if aid in ids]
+            if conf:
+                avisos.append("Conflictos de programación:\n" + "\n".join("• " + c for c in conf[:4])
+                              + ("\n(y %d más; mira Sistema → Revisar conflictos)" % (len(conf) - 4)
+                                 if len(conf) > 4 else ""))
+            if avisos:
+                self.config(cursor="")
+                messagebox.showwarning("Revisa este audio", "\n\n".join(avisos), parent=self)
+        except Exception as e:
+            self.app.log("Aviso al guardar '%s': %s" % (nombre, motivo_error(e)))
+        finally:
+            self.destroy()
 
 
 # ----------------------------------------------------------------------
@@ -1663,6 +1687,10 @@ class App:
         self.rep.al_fallo = lambda a, motivo: self.marcar_problema(a["id"], motivo)
         self.rep.al_exito = self._audio_sono
         self.manual = self.db.cfg("modo_manual", "0") == "1"
+        self.limpiar_huerfanos()
+        # último minuto ya ejecutado: si el programa se reinicia en ese mismo minuto
+        # (por ejemplo al actualizarse) no vuelve a lanzar los audios de ese minuto
+        self.ultimo_minuto = self.db.cfg("ultimo_minuto", "") or None
         self.refrescar_categorias()
         self.refrescar_audios()
         self.cola_nivelar = []
@@ -2740,6 +2768,40 @@ class App:
                                 % (cuando(t), a["nombre"], prev["nombre"], self._mmss(dur[prev["id"]]))))
             ini = max(t, fin_prev) if fin_prev else t
             fin_prev, prev = ini + dt.timedelta(seconds=dur.get(a["id"], 0)), a
+        # 4) cómo está configurado cada audio
+        hoy = base.date().isoformat()
+        con_emision = {a["id"] for _, a in ems}
+        for a in audios:
+            if a["id"] not in con_emision:
+                if a["fecha_fin"] and a["fecha_fin"] < hoy:
+                    motivo = "su vigencia terminó el %s" % a["fecha_fin"]
+                else:
+                    motivo = "no le toca sonar en los próximos %d días (revisa los días y las horas)" % dias
+                res.append(({a["id"]}, "«%s» está activo pero %s." % (a["nombre"], motivo)))
+        for a in audios:                    # horas exactas que ya cubre otra regla del mismo audio
+            exactas = {hhmm_a_min(h) for h in a["horas"].split(",") if h}
+            otras = set()
+            mins = [int(m) for m in a["minutos"].split(",") if m != ""]
+            for hora in range(a["hora_desde"], a["hora_hasta"] + 1):
+                otras.update(hora * 60 + m for m in mins)
+            n = a["intervalo"] or 0
+            if n > 0 and a["int_desde"] and a["int_hasta"]:
+                otras.update(range(hhmm_a_min(a["int_desde"]), hhmm_a_min(a["int_hasta"]) + 1, n))
+            rep = sorted(exactas & otras)
+            if rep:
+                res.append(({a["id"]}, "«%s»: la hora %s ya la cubre otra de sus reglas; sonará "
+                            "una sola vez, no se repite." % (a["nombre"], ", ".join(
+                                fmt_hora("%02d:%02d" % divmod(m, 60)) for m in rep[:4]))))
+        iguales = {}                        # mismo archivo y misma programación
+        for a in audios:
+            if a["huella"]:
+                clave = (a["huella"], a["dias"], frozenset(minutos_programados(a)))
+                iguales.setdefault(clave, []).append(a)
+        for lista in iguales.values():
+            if len(lista) > 1:
+                res.append(({a["id"] for a in lista}, "%s son el mismo archivo con la misma "
+                            "programación: sonarían repetidos." %
+                            " y ".join("«%s»" % a["nombre"] for a in lista)))
         return res
 
     def ver_conflictos(self):
@@ -2779,14 +2841,64 @@ class App:
     def eliminar_audio(self):
         a = self.sel_audio()
         if a and messagebox.askyesno("Eliminar", "¿Eliminar '%s'?" % a["nombre"]):
+            self.rep.quitar_audio(a["id"])           # fuera de la cola (y se detiene si suena)
             self.db.x("DELETE FROM audios WHERE id=?", (a["id"],))
-            for r in (a["ruta"], a["ruta_norm"]):
-                try:
-                    if r and os.path.dirname(r) == CARPETA_AUDIOS:
-                        os.remove(r)
-                except OSError:
-                    pass
+            self.borrar_archivos_audio(a)
             self.refrescar_audios()
+            self.actualizar_alerta()
+
+    def borrar_archivos_audio(self, a, conservar=()):
+        """Borra las copias propias de un audio: la original copiada, la nivelada y las de
+        la caché de conversión. Nunca toca archivos fuera de la carpeta del programa ni
+        uno que use otro audio."""
+        carpeta = os.path.abspath(CARPETA_AUDIOS)
+        ajenas = {os.path.abspath(p) for r in self.db.q("SELECT ruta, ruta_norm FROM audios")
+                  for p in (r["ruta"], r["ruta_norm"]) if p}
+        ajenas |= {os.path.abspath(p) for p in conservar}
+        candidatos = [a["ruta"], a["ruta_norm"]]
+        cache = os.path.join(carpeta, "cache")
+        if os.path.isdir(cache):
+            candidatos += [os.path.join(cache, f) for f in os.listdir(cache)
+                           if f.startswith("c_%s_" % a["id"])]
+        for r in candidatos:
+            try:
+                if (r and os.path.dirname(os.path.abspath(r)) in (carpeta, cache)
+                        and os.path.abspath(r) not in ajenas and os.path.exists(r)):
+                    os.remove(r)
+            except OSError:
+                pass
+
+    def limpiar_huerfanos(self):
+        """Al abrir: borra copias que ya no pertenecen a ningún audio (quedaron de ediciones
+        o de errores). Solo toca archivos con los nombres que crea este programa."""
+        try:
+            carpeta = os.path.abspath(CARPETA_AUDIOS)
+            filas = self.db.q("SELECT id, ruta, ruta_norm FROM audios")
+            usadas = {os.path.abspath(p) for r in filas for p in (r["ruta"], r["ruta_norm"]) if p}
+            ids = {str(r["id"]) for r in filas}
+            borrados = 0
+
+            def quitar(ruta):               # un archivo bloqueado no detiene la limpieza
+                try:
+                    os.remove(ruta)
+                    return 1
+                except OSError:
+                    return 0
+            for f in os.listdir(carpeta):
+                ruta = os.path.join(carpeta, f)
+                if (os.path.isfile(ruta) and os.path.abspath(ruta) not in usadas
+                        and (re.match(r"^\d{10,}_", f) or re.match(r"^n_\d+_\d+\.wav$", f))):
+                    borrados += quitar(ruta)
+            cache = os.path.join(carpeta, "cache")
+            if os.path.isdir(cache):
+                for f in os.listdir(cache):
+                    m = re.match(r"^c_(\d+)_\d+\.wav$", f)
+                    if m and m.group(1) not in ids:
+                        borrados += quitar(os.path.join(cache, f))
+            if borrados:
+                self.log("Limpieza: se borraron %d copia(s) de audios que ya no existen." % borrados)
+        except OSError:
+            pass
 
     def alternar_audio(self):
         a = self.sel_audio()
@@ -3130,6 +3242,7 @@ class App:
         clave = ahora.strftime("%Y-%m-%d %H:%M")
         if clave != self.ultimo_minuto:
             self.ultimo_minuto = clave
+            self.db.set_cfg("ultimo_minuto", clave)
             self.calcular_proximo()
             toca = [] if self.manual else [      # en modo manual no suena nada programado
                 a for a in self.db.q("SELECT * FROM audios WHERE activo=1")
