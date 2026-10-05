@@ -1268,12 +1268,15 @@ class Reproductor:
 
     @staticmethod
     def _quiere_atenuar(a):
-        """¿Este audio baja el volumen de las otras apps mientras suena?"""
+        """¿Este audio baja el volumen de las otras apps mientras suena? Un audio con
+        prioridad SIEMPRE lo hace (así se remarca); en los demás es una opción del audio."""
+        if a["prioridad"]:
+            return True
         try:
             v = a["atenuar"]
         except (IndexError, KeyError):
             v = None
-        return bool(a["prioridad"]) if v is None else bool(v)
+        return bool(v)
 
     # ---------- volumen de otras apps (pycaw) ----------
     def _capturar_otros(self):
@@ -1407,9 +1410,11 @@ class DialogoAudio(tk.Toplevel):
                         ).grid(row=r, column=1, columnspan=3, sticky="w", pady=3)
         r += 1
         self.v_atenuar = tk.IntVar(value=1)
-        ttk.Checkbutton(f, text="Bajar el volumen de las otras apps (YouTube Music, Spotify, "
-                                "navegador...) mientras suena", variable=self.v_atenuar
-                        ).grid(row=r, column=1, columnspan=3, sticky="w")
+        self.chk_atenuar = ttk.Checkbutton(
+            f, text="Bajar el volumen de las otras apps (YouTube Music, Spotify, navegador...) "
+                    "mientras suena", variable=self.v_atenuar)
+        self.chk_atenuar.grid(row=r, column=1, columnspan=3, sticky="w")
+        self.v_prio.trace_add("write", lambda *a: self._sinc_prioridad())
         r += 1
         self.v_activo = tk.IntVar(value=1)
         ttk.Checkbutton(f, text="Activo", variable=self.v_activo
@@ -1492,6 +1497,15 @@ class DialogoAudio(tk.Toplevel):
             self.v_ruta.set(archivo)
             self.v_nombre.set(os.path.splitext(os.path.basename(archivo))[0])
 
+    def _sinc_prioridad(self):
+        """Un audio con prioridad siempre baja el sonido general: la casilla queda marcada
+        y bloqueada para que se vea que no es opcional."""
+        if self.v_prio.get():
+            self.v_atenuar.set(1)
+            self.chk_atenuar.state(["disabled"])
+        else:
+            self.chk_atenuar.state(["!disabled"])
+
     def cargar(self, a):
         self.v_nombre.set(a["nombre"])
         self.v_ruta.set(a["ruta"])
@@ -1501,6 +1515,7 @@ class DialogoAudio(tk.Toplevel):
         self.v_prio.set(a["prioridad"])
         # audios antiguos (sin la opción guardada): la opción sigue a la prioridad, como antes
         self.v_atenuar.set(a["prioridad"] if a["atenuar"] is None else a["atenuar"])
+        self._sinc_prioridad()
         self.v_activo.set(a["activo"])
         activos = [int(d) for d in a["dias"].split(",") if d != ""]
         for i, v in enumerate(self.v_dias):
@@ -1938,7 +1953,7 @@ class App:
         self.vol_win = VolumenWindows()
         self.construir_ui()
         try:
-            self.rep = Reproductor(self.log, 0.25)
+            self.rep = Reproductor(self.log, 0.5)
             self.aplicar_config()
         except Exception as e:
             messagebox.showerror("Audio", "No se pudo iniciar el sistema de audio:\n%s" % e)
@@ -2414,13 +2429,13 @@ class App:
         fv = ttk.LabelFrame(f, text="Damper (bajar el volumen de las otras apps y del audio en "
                                     "curso mientras suena un audio)", padding=8)
         fv.pack(fill="x", pady=6)
-        self.v_pct = tk.StringVar(value=self.db.cfg("bajar_pct", "25"))
+        self.v_pct = tk.StringVar(value=self.db.cfg("bajar_pct", "50"))
         self.v_rampa = tk.StringVar(value=self.db.cfg("damper_rampa", "1.5"))
         self.v_espera = tk.StringVar(value=self.db.cfg("damper_espera", "30"))
         self.v_modo = tk.StringVar(value=self.MODOS[1 if self.db.cfg(
             "damper_modo", "mezclar") == "pausar" else 0])
         self.v_fundido = tk.StringVar(value=self.db.cfg("fundido", "0.5"))
-        filas = (("Bajar otros programas y el audio en curso al (%):", self.v_pct, 0, 90, 5),
+        filas = (("Bajar el sonido general (otras apps y audio en curso) al (%):  [más alto = baja menos]", self.v_pct, 0, 90, 5),
                  ("Rampa del damper: tiempo de bajada y de subida (seg):", self.v_rampa,
                   0, 10, 0.5),
                  ("Espera tras una prioridad antes del siguiente en cola (seg):", self.v_espera,
@@ -2822,7 +2837,7 @@ class App:
 
     def aplicar_config(self):
         r, cfg = self.rep, self.db.cfg
-        r.factor_duck = self._num(cfg("bajar_pct", "25"), 25, 0, 90) / 100.0
+        r.factor_duck = self._num(cfg("bajar_pct", "50"), 50, 0, 90) / 100.0
         r.rampa = self._num(cfg("damper_rampa", "1.5"), 1.5, 0, 10)
         r.espera = self._num(cfg("damper_espera", "30"), 30, 0, 300)
         r.modo_pausa = cfg("damper_modo", "mezclar") == "pausar"
@@ -2834,7 +2849,7 @@ class App:
 
     def guardar_damper(self):
         s = self.db.set_cfg
-        s("bajar_pct", int(self._num(self.v_pct.get(), 25, 0, 90)))
+        s("bajar_pct", int(self._num(self.v_pct.get(), 50, 0, 90)))
         s("damper_rampa", self._num(self.v_rampa.get(), 1.5, 0, 10))
         s("damper_espera", self._num(self.v_espera.get(), 30, 0, 300))
         s("damper_modo", "pausar" if self.v_modo.get() == self.MODOS[1] else "mezclar")

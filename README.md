@@ -1,4 +1,4 @@
-﻿# Audiomático
+# Audiomático
 
 Programador de audios para Windows. Reproduce tus audios (MP3, WAV, OGG, FLAC) a las horas que indiques, con cola, prioridades y control de volumen. Funciona desde **Windows 7** en adelante, en 32 y 64 bits.
 
@@ -10,7 +10,7 @@ Programador de audios para Windows. Reproduce tus audios (MP3, WAV, OGG, FLAC) a
 - **Programación flexible.** Cada audio combina tres reglas independientes: horas exactas (10:30, 18:40), minutos de cada hora, y repetición cada N minutos dentro de una ventana (por ejemplo, cada 15 min de 09:00 a 22:00). Suena cuando se cumpla cualquiera.
 - **Formato de 12 o 24 horas.** Se elige en Sistema; las horas se pueden escribir como `18:40` o `6:40 PM`.
 - **Días y vigencia.** Elige los días de la semana y hasta cuándo vale cada audio.
-- **Prioridad con damper.** Un audio con prioridad suena primero y baja suavemente el volumen de los demás programas y del audio en curso. Al terminar, el volumen sube de forma progresiva. Hay una espera configurable antes del siguiente audio en cola.
+- **Prioridad con damper.** Un audio con prioridad suena primero y baja un poco el sonido general (otras apps y audio en curso, por defecto al 50 %, ajustable) para resaltarlo. Al terminar, el volumen sube de forma progresiva. Hay una espera configurable antes del siguiente audio en cola.
 - **Cola visible.** Se puede reordenar arrastrando, quitar elementos, pausar y saltar al siguiente.
 - **A prueba de fallos con los audios.** Lee WAV de cualquier variante (8/16/24/32 bits, coma flotante, A-law, varios canales), audios muy bajos o con largos silencios y audios muy largos (suenan en streaming). Si un archivo falta o no se puede leer, lo avisa con un ⚠ en la lista y no detiene el resto. Opcionalmente recorta el silencio sobrante al inicio y al final.
 - **Atenúa otras apps (YouTube Music, Spotify, el navegador…).** Cada audio tiene la opción «Bajar el volumen de las otras apps»; la pestaña **Apps** muestra qué apps usan el audio (con su icono, la ventana y su volumen), permite elegir cuáles se atenúan, añadir una a mano y probar la atenuación. Si el programa se cierra de golpe, al abrir devuelve su volumen a las apps que hubieran quedado bajas.
