@@ -2947,7 +2947,9 @@ class App:
         a = filas[0]
         if not activa:
             return
-        if (not forzar and a["objetivo_db"] == obj and a["nivel_db"] is not None):
+        # nivel_db = -99 marca "falló la última vez": se reintenta (por ejemplo tras instalar
+        # una versión con mejores decodificadores) en cada arranque
+        if (not forzar and a["objetivo_db"] == obj and a["nivel_db"] not in (None, -99)):
             return
         self._borrar_norm(a)
         destino = os.path.join(CARPETA_AUDIOS, "n_%d_%d.wav" % (aid, int(time.time() * 1000)))
@@ -2994,8 +2996,8 @@ class App:
             ids = [r["id"] for r in self.db.q("SELECT id FROM audios")]
         else:
             ids = [r["id"] for r in self.db.q(
-                "SELECT id FROM audios WHERE nivel_db IS NULL OR objetivo_db IS NULL "
-                "OR objetivo_db<>?", (obj,))]
+                "SELECT id FROM audios WHERE nivel_db IS NULL OR nivel_db=-99 "
+                "OR objetivo_db IS NULL OR objetivo_db<>?", (obj,))]
         if forzar:
             self.db.x("UPDATE audios SET objetivo_db=NULL")
         # sin repetir: solo se añaden los que aún no están en la cola, y no se abre
