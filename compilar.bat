@@ -39,7 +39,7 @@ if not exist ".venv%ARQ%\Scripts\python.exe" %PY% -m venv ".venv%ARQ%"
 ".venv%ARQ%\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --noconsole ^
     --name Audiomatico --icon "%~dp0icono.ico" --add-data "%~dp0icono.ico;." ^
     --distpath "dist\%ARQ%bits" --workpath "build\%ARQ%" --specpath "build" ^
-    --hidden-import comtypes.stream ^
+    --hidden-import comtypes.stream --hidden-import _cffi_backend --hidden-import _miniaudio ^
     programador_audios.py
 exit /b 0
 

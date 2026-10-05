@@ -13,6 +13,8 @@ Programador de audios para Windows. Reproduce tus audios (MP3, WAV, OGG, FLAC) a
 - **Prioridad con damper.** Un audio con prioridad suena primero y baja suavemente el volumen de los demás programas y del audio en curso. Al terminar, el volumen sube de forma progresiva. Hay una espera configurable antes del siguiente audio en cola.
 - **Cola visible.** Se puede reordenar arrastrando, quitar elementos, pausar y saltar al siguiente.
 - **A prueba de fallos con los audios.** Lee WAV de cualquier variante (8/16/24/32 bits, coma flotante, A-law, varios canales), audios muy bajos o con largos silencios y audios muy largos (suenan en streaming). Si un archivo falta o no se puede leer, lo avisa con un ⚠ en la lista y no detiene el resto. Opcionalmente recorta el silencio sobrante al inicio y al final.
+- **Atenúa otras apps (YouTube Music, Spotify, el navegador…).** Cada audio tiene la opción «Bajar el volumen de las otras apps»; la pestaña **Apps** muestra qué apps usan el audio (con su icono, la ventana y su volumen), permite elegir cuáles se atenúan, añadir una a mano y probar la atenuación. Si el programa se cierra de golpe, al abrir devuelve su volumen a las apps que hubieran quedado bajas.
+- **MP3 de cualquier tipo**, incluidas las voces sintéticas (MPEG-2, mono, 24 kHz), con un decodificador de respaldo. `Audiomatico.exe --diagnostico archivo.mp3` genera `diagnostico.txt` con qué se puede leer y qué no.
 - **Modo manual.** Un botón detiene la programación sin cerrar el programa (con aviso rojo para no olvidarlo).
 - **Revisión de la programación.** Avisa de audios que caen en el mismo minuto, que empezarían tarde porque el anterior no terminó, o que duran más que su repetición.
 - **Nivelación de volumen.** Cada audio se mide y se guarda al mismo nivel, sin distorsión. El fader **TOPE** fija en vivo el nivel máximo en decibelios.
@@ -25,6 +27,8 @@ Programador de audios para Windows. Reproduce tus audios (MP3, WAV, OGG, FLAC) a
 - Se queda en segundo plano junto al reloj, puede iniciar con Windows y abrirse a una hora programada.
 
 ![Categorías](capturas/2_categorias.png)
+
+![Apps con audio](capturas/7_apps.png)
 
 ## Instalación (usuarios)
 

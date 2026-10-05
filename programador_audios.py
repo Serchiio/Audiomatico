@@ -108,7 +108,8 @@ class BD:
                           ("int_hasta", "TEXT DEFAULT ''"),
                           ("huella", "TEXT DEFAULT ''"),
                           ("duracion", "REAL"),
-                          ("problema", "TEXT DEFAULT ''")):
+                          ("problema", "TEXT DEFAULT ''"),
+                          ("atenuar", "INTEGER")):        # NULL = según la prioridad
             try:
                 self.c.execute("ALTER TABLE audios ADD COLUMN %s %s" % (col, tipo))
             except sqlite3.OperationalError:
@@ -360,6 +361,56 @@ def medir_pcm(raw, canales, frecuencia):
     return _db(math.sqrt(suma / n)), _db(audioop.max(raw, 2))
 
 
+try:
+    import miniaudio          # decodificador de respaldo (MP3/OGG/FLAC/WAV) que no usa SDL
+except Exception:
+    miniaudio = None
+
+NIVEL_ESTIMADO = -12.0        # dB que se supone a un audio que no se pudo medir (voces/anuncios)
+
+
+def mp3_segundos(ruta):
+    """Duración de un MP3 leyendo solo su cabecera (etiqueta Xing/Info o bitrate constante).
+    None si no se puede."""
+    try:
+        with open(ruta, "rb") as f:
+            d = f.read(8192)
+        tam = os.path.getsize(ruta)
+        pos = 0
+        if d[:3] == b"ID3":
+            pos = 10 + ((d[6] & 0x7F) << 21 | (d[7] & 0x7F) << 14 | (d[8] & 0x7F) << 7 | (d[9] & 0x7F))
+            with open(ruta, "rb") as f:
+                f.seek(pos)
+                d = f.read(8192)
+            base = pos
+        else:
+            base = 0
+        for i in range(len(d) - 4):
+            if d[i] == 0xFF and (d[i + 1] & 0xE0) == 0xE0:
+                ver, capa = (d[i + 1] >> 3) & 3, (d[i + 1] >> 1) & 3
+                br_i, sr_i = d[i + 2] >> 4, (d[i + 2] >> 2) & 3
+                if ver == 1 or capa != 1 or br_i in (0, 15) or sr_i == 3:
+                    continue                                  # solo capa III válida
+                mpeg1 = ver == 3
+                bitrate = ([32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320] if mpeg1
+                           else [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160])[br_i - 1] * 1000
+                frec = ([44100, 48000, 32000] if ver == 3 else [22050, 24000, 16000] if ver == 2
+                        else [11025, 12000, 8000])[sr_i]
+                muestras = 1152 if mpeg1 else 576
+                mono = (d[i + 3] >> 6) == 3
+                lado = (17 if mono else 32) if mpeg1 else (9 if mono else 17)
+                for marca in (b"Xing", b"Info"):
+                    j = d.find(marca, i, i + 4 + lado + 2 + 4)
+                    if j >= 0 and d[j + 7] & 1:
+                        frames = struct.unpack(">I", d[j + 8:j + 12])[0]
+                        if frames:
+                            return frames * muestras / float(frec)
+                return (tam - base - i) * 8.0 / bitrate
+    except Exception:
+        pass
+    return None
+
+
 def decodificado_estimado(ruta):
     """Bytes de PCM que ocuparía el audio decodificado, sin decodificarlo."""
     tam = os.path.getsize(ruta)
@@ -369,7 +420,11 @@ def decodificado_estimado(ruta):
                 return int(w.getnframes() / float(w.getframerate()) * 176400)
         except Exception:
             return tam * 4
-    return tam * 10          # mp3/ogg: unas 10 veces más grande al decodificar
+    if ruta.lower().endswith(".mp3"):
+        seg = mp3_segundos(ruta)
+        if seg:
+            return int(seg * 176400)
+    return tam * 10          # ogg/flac/otros: unas 10 veces más grande al decodificar
 
 
 def duracion_estimada(ruta):
@@ -378,6 +433,10 @@ def duracion_estimada(ruta):
         if ruta.lower().endswith(".wav"):
             with wave.open(ruta, "rb") as w:
                 return w.getnframes() / float(w.getframerate())
+        if ruta.lower().endswith(".mp3"):
+            seg = mp3_segundos(ruta)
+            if seg:
+                return seg
         return os.path.getsize(ruta) / 16000.0
     except Exception:
         return 0.0
@@ -472,14 +531,23 @@ def cargar_pcm(ruta):
         del snd
         return raw, init[0], init[2]
     except Exception as e1:
-        if ruta.lower().endswith(".wav"):
+        errores = [motivo_error(e1)]
+        if miniaudio is not None:               # 2.º intento: decodificador propio (MP3 MPEG-2, etc.)
+            try:
+                with open(ruta, "rb") as f:
+                    datos = f.read()
+                d = miniaudio.decode(datos, output_format=miniaudio.SampleFormat.SIGNED16,
+                                     nchannels=init[2], sample_rate=init[0])
+                return d.samples.tobytes(), init[0], init[2]
+            except Exception as e3:
+                errores.append("miniaudio: " + motivo_error(e3))
+        if ruta.lower().endswith(".wav"):       # 3.er intento: lector de WAV propio
             try:
                 return leer_wav_generico(ruta, init[0], init[2]), init[0], init[2]
             except Exception as e2:
-                raise ValueError("no se pudo leer el audio (%s | %s)" % (
-                    motivo_error(e1), motivo_error(e2)))
-        raise ValueError("no se pudo leer el audio: %s. Conviértelo a MP3 o WAV estándar." %
-                         motivo_error(e1))
+                errores.append(motivo_error(e2))
+        raise ValueError("no se pudo leer el audio (%s). Conviértelo a MP3 o WAV estándar." %
+                         " | ".join(errores))
 
 
 def recortar_silencios(raw, canales, frec, margen=0.3, umbral_db=-60.0, minimo=1.0):
@@ -814,10 +882,16 @@ class Reproductor:
         # --- damper ---
         self.duck = 0.0               # 0 = sin bajar ... 1 = bajado del todo
         self.duck_meta = 0.0
-        self.sesiones = []            # [(SimpleAudioVolume, volumen_original)]
+        self.duck_o = 0.0             # lo mismo, pero para las OTRAS apps de Windows
+        self.forzar_atenuar_hasta = 0.0   # prueba manual desde la pestaña Apps
+        self.persistir = None         # función(dict|None): guarda los volúmenes originales
+        self.apps_excluir = set()     # nombres de proceso (minúsculas) que nunca se atenúan
+        self.sesiones = []            # [(pid, nombre, SimpleAudioVolume, volumen_original)]
         self.sesiones_cap = False
         self.mult_otros = 1.0
         self.t_otros = 0.0
+        self.t_captura = 0.0
+        self._avisado_sin_apps = False
 
     # ---------- utilidades ----------
     def ruta_de(self, a):
@@ -847,8 +921,8 @@ class Reproductor:
 
     def _factor(self, nivel):
         """Volumen (0-1) que lleva el audio al tope elegido; nunca amplifica."""
-        if nivel is None:
-            return 1.0
+        if nivel is None:             # no se pudo medir: se supone un nivel típico, no a todo volumen
+            nivel = NIVEL_ESTIMADO
         return min(1.0, 10 ** ((self.tope - nivel) / 20.0))
 
     @staticmethod
@@ -1177,45 +1251,99 @@ class Reproductor:
                 self.prio_snd.set_volume(v)
             except Exception:
                 pass
-        self._volumen_otros(mult)
+        # 4) damper de las OTRAS apps de Windows: lo piden los audios que tienen activada la
+        #    opción "bajar el volumen de otras apps" (por defecto, los de prioridad)
+        quiere = ((not self.pausado) and any(
+            self._quiere_atenuar(x) for x in (
+                self.actual if not self.pausa_por_prio else None, self.prio_actual)
+            if x is not None)) or time.time() < self.forzar_atenuar_hasta
+        meta_o = 1.0 if quiere else 0.0
+        if self.rampa <= 0:
+            self.duck_o = meta_o
+        elif self.duck_o < meta_o:
+            self.duck_o = min(meta_o, self.duck_o + dt / self.rampa)
+        elif self.duck_o > meta_o:
+            self.duck_o = max(meta_o, self.duck_o - dt / self.rampa)
+        self._volumen_otros(1.0 - (1.0 - self.factor_duck) * self.duck_o)
 
-    # ---------- volumen de otros programas (pycaw) ----------
-    def _capturar_otros(self):
-        self.sesiones_cap = True
-        self.sesiones = []
-        if AudioUtilities is None:
-            return
+    @staticmethod
+    def _quiere_atenuar(a):
+        """¿Este audio baja el volumen de las otras apps mientras suena?"""
         try:
+            v = a["atenuar"]
+        except (IndexError, KeyError):
+            v = None
+        return bool(a["prioridad"]) if v is None else bool(v)
+
+    # ---------- volumen de otras apps (pycaw) ----------
+    def _capturar_otros(self):
+        """Añade a la lista las apps con audio que aún no están (también las que empiezan a
+        sonar con el damper ya activo). Cada una recuerda su volumen original."""
+        self.sesiones_cap = True
+        if AudioUtilities is None:
+            return 0
+        nuevas = []
+        try:
+            conocidas = {pid for pid, _, _, _ in self.sesiones}
             for s in AudioUtilities.GetAllSessions():
-                if s.Process is None or s.ProcessId == os.getpid():
-                    continue
-                vol = s.SimpleAudioVolume
-                self.sesiones.append((vol, vol.GetMasterVolume()))
+                try:
+                    if s.Process is None or s.ProcessId == os.getpid() or s.ProcessId in conocidas:
+                        continue
+                    nombre = s.Process.name()
+                    if nombre.lower() in self.apps_excluir:
+                        continue
+                    vol = s.SimpleAudioVolume
+                    self.sesiones.append((s.ProcessId, nombre, vol, vol.GetMasterVolume()))
+                    nuevas.append(nombre)
+                except Exception:
+                    continue                      # una app que se cerró justo ahora
         except Exception as e:
-            self.log("No se pudo bajar el volumen de otros programas: %s" % e)
+            self.log("No se pudo bajar el volumen de otras apps: %s" % motivo_error(e))
+            return 0
+        if nuevas:
+            self.log("Bajando el volumen de otras apps (al %d %%): %s." % (
+                round(self.factor_duck * 100), ", ".join(sorted(set(nuevas)))))
+            if self.persistir:          # por si el programa se cierra de golpe: ver restaurar_pendientes
+                orig = {}
+                for _, n, _, o in self.sesiones:
+                    orig.setdefault(n, o)
+                self.persistir(orig)
+        elif not self.sesiones and not self._avisado_sin_apps:
+            self._avisado_sin_apps = True
+            self.log("No se detectó ninguna otra app con audio para atenuar.")
+        return len(nuevas)
 
     def _restaurar_otros_ya(self):
-        for vol, orig in self.sesiones:
+        for _, _, vol, orig in self.sesiones:
             try:
                 vol.SetMasterVolume(orig, None)
             except Exception:
                 pass
+        if self.sesiones and self.persistir:
+            self.persistir(None)
         self.sesiones = []
         self.sesiones_cap = False
         self.mult_otros = 1.0
+        self._avisado_sin_apps = False
+
+    def atenuadas(self):
+        """Nombres de las apps que ahora mismo tienen el volumen bajado."""
+        return sorted({n for _, n, _, _ in self.sesiones}) if self.duck_o > 0 else []
 
     def _volumen_otros(self, mult):
-        if self.duck <= 0.0:
+        if self.duck_o <= 0.0:
             if self.sesiones_cap:
                 self._restaurar_otros_ya()
             return
-        if not self.sesiones_cap:
-            self._capturar_otros()
         ahora = time.time()
+        if not self.sesiones_cap or ahora - self.t_captura > 1.5:    # y las que empiecen después
+            self.t_captura = ahora
+            if self._capturar_otros():
+                self.mult_otros = -1.0                              # fuerza aplicar a las nuevas
         if abs(mult - self.mult_otros) < 0.004 or ahora - self.t_otros < 0.08:
             return
         self.t_otros, self.mult_otros = ahora, mult
-        for vol, orig in self.sesiones:
+        for _, _, vol, orig in self.sesiones:
             try:
                 vol.SetMasterVolume(max(0.0, orig * mult), None)
             except Exception:
@@ -1274,9 +1402,14 @@ class DialogoAudio(tk.Toplevel):
         r += 1
 
         self.v_prio = tk.IntVar()
-        ttk.Checkbutton(f, text="PRIORIDAD (suena primero y baja el volumen de lo demás: "
-                                "otros programas y el audio en curso)", variable=self.v_prio
+        ttk.Checkbutton(f, text="PRIORIDAD (suena primero; si ya suena otro audio, lo atenúa "
+                                "y se mezcla encima)", variable=self.v_prio
                         ).grid(row=r, column=1, columnspan=3, sticky="w", pady=3)
+        r += 1
+        self.v_atenuar = tk.IntVar(value=1)
+        ttk.Checkbutton(f, text="Bajar el volumen de las otras apps (YouTube Music, Spotify, "
+                                "navegador...) mientras suena", variable=self.v_atenuar
+                        ).grid(row=r, column=1, columnspan=3, sticky="w")
         r += 1
         self.v_activo = tk.IntVar(value=1)
         ttk.Checkbutton(f, text="Activo", variable=self.v_activo
@@ -1366,6 +1499,8 @@ class DialogoAudio(tk.Toplevel):
             if c["id"] == a["categoria_id"]:
                 self.v_cat.set(c["nombre"])
         self.v_prio.set(a["prioridad"])
+        # audios antiguos (sin la opción guardada): la opción sigue a la prioridad, como antes
+        self.v_atenuar.set(a["prioridad"] if a["atenuar"] is None else a["atenuar"])
         self.v_activo.set(a["activo"])
         activos = [int(d) for d in a["dias"].split(",") if d != ""]
         for i, v in enumerate(self.v_dias):
@@ -1500,6 +1635,7 @@ class DialogoAudio(tk.Toplevel):
             cambio = True
         if huella:
             db.x("UPDATE audios SET huella=? WHERE id=?", (huella, aid))
+        db.x("UPDATE audios SET atenuar=? WHERE id=?", (int(self.v_atenuar.get()), aid))
         # Desde aquí el audio ya está guardado: pase lo que pase la ventana se cierra, así no
         # se queda abierta con el botón Guardar listo para crear el mismo audio otra vez.
         try:
@@ -1590,6 +1726,131 @@ class SoltarArchivos:
         """Lista de lotes de archivos soltados desde la última vez."""
         lotes, self.buzon = self.buzon, []
         return lotes
+
+
+# ----------------------------------------------------------------------
+# Apps con audio: nombre, icono y título de ventana (como el Mezclador de Windows)
+# ----------------------------------------------------------------------
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+
+def descripcion_exe(ruta):
+    """Descripción de un programa (ej. 'Google Chrome') leída de su .exe, o None."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        v = ctypes.windll.version
+        n = v.GetFileVersionInfoSizeW(ruta, None)
+        if not n:
+            return None
+        buf = ctypes.create_string_buffer(n)
+        if not v.GetFileVersionInfoW(ruta, 0, n, buf):
+            return None
+        p, ln = ctypes.c_void_p(), wintypes.UINT()
+        if not v.VerQueryValueW(buf, "\\VarFileInfo\\Translation", ctypes.byref(p),
+                                ctypes.byref(ln)) or ln.value < 4:
+            return None
+        lang, cp = struct.unpack("<HH", ctypes.string_at(p.value, 4))
+        if not v.VerQueryValueW(buf, "\\StringFileInfo\\%04x%04x\\FileDescription" % (lang, cp),
+                                ctypes.byref(p), ctypes.byref(ln)) or not ln.value:
+            return None
+        return ctypes.wstring_at(p.value).strip() or None
+    except Exception:
+        return None
+
+
+def titulo_ventana(pid):
+    """Título de la ventana visible de un proceso o de sus procesos padre (en los navegadores
+    el audio sale de un proceso auxiliar y la ventana es del principal). None si no hay."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        pids = {pid}
+        if psutil is not None:
+            try:
+                p = psutil.Process(pid)
+                for _ in range(3):
+                    p = p.parent()
+                    if p is None:
+                        break
+                    pids.add(p.pid)
+            except Exception:
+                pass
+        u = ctypes.windll.user32
+        hallados = []
+
+        def cb(hwnd, lparam):
+            if u.IsWindowVisible(hwnd):
+                proc = wintypes.DWORD()
+                u.GetWindowThreadProcessId(hwnd, ctypes.byref(proc))
+                if proc.value in pids:
+                    n = u.GetWindowTextLengthW(hwnd)
+                    if n > 0:
+                        b = ctypes.create_unicode_buffer(n + 1)
+                        u.GetWindowTextW(hwnd, b, n + 1)
+                        hallados.append(b.value)
+            return True
+        u.EnumWindows(ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(cb), 0)
+        return max(hallados, key=len) if hallados else None
+    except Exception:
+        return None
+
+
+def icono_exe(ruta, tam=20):
+    """PhotoImage con el icono de un .exe (sobre fondo blanco), o None."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        from PIL import Image, ImageTk
+        vp, ci, cu = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint
+        u, g, sh = ctypes.windll.user32, ctypes.windll.gdi32, ctypes.windll.shell32
+        u.GetDC.restype, u.GetDC.argtypes = vp, [vp]
+        u.ReleaseDC.argtypes = [vp, vp]
+        u.DrawIconEx.argtypes = [vp, ci, ci, vp, ci, ci, cu, vp, cu]
+        u.DestroyIcon.argtypes = [vp]
+        g.CreateCompatibleDC.restype, g.CreateCompatibleDC.argtypes = vp, [vp]
+        g.CreateCompatibleBitmap.restype, g.CreateCompatibleBitmap.argtypes = vp, [vp, ci, ci]
+        g.SelectObject.restype, g.SelectObject.argtypes = vp, [vp, vp]
+        g.PatBlt.argtypes = [vp, ci, ci, ci, ci, cu]
+        g.GetDIBits.argtypes = [vp, vp, cu, cu, vp, vp, cu]
+        g.DeleteObject.argtypes = [vp]
+        g.DeleteDC.argtypes = [vp]
+        sh.ExtractIconExW.argtypes = [ctypes.c_wchar_p, ci, ctypes.POINTER(vp), ctypes.POINTER(vp), cu]
+        grande, pequeno = vp(), vp()
+        if not sh.ExtractIconExW(ruta, 0, ctypes.byref(grande), ctypes.byref(pequeno), 1):
+            return None
+        hicon = grande.value or pequeno.value
+        if not hicon:
+            return None
+
+        class BIH(ctypes.Structure):
+            _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                        ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                        ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                        ("biSizeImage", wintypes.DWORD), ("a", wintypes.LONG),
+                        ("b", wintypes.LONG), ("c", wintypes.DWORD), ("d", wintypes.DWORD)]
+        hdc = u.GetDC(None)
+        mdc = g.CreateCompatibleDC(hdc)
+        bmp = g.CreateCompatibleBitmap(hdc, tam, tam)
+        g.SelectObject(mdc, bmp)
+        g.PatBlt(mdc, 0, 0, tam, tam, 0x00FF0062)               # fondo blanco
+        u.DrawIconEx(mdc, 0, 0, hicon, tam, tam, 0, None, 3)
+        buf = ctypes.create_string_buffer(tam * tam * 4)
+        bi = BIH(ctypes.sizeof(BIH), tam, -tam, 1, 32, 0, 0, 0, 0, 0, 0)
+        g.GetDIBits(mdc, bmp, 0, tam, buf, ctypes.byref(bi), 0)
+        g.DeleteObject(bmp)
+        g.DeleteDC(mdc)
+        u.ReleaseDC(None, hdc)
+        for h in {grande.value, pequeno.value}:
+            if h:
+                u.DestroyIcon(h)
+        img = Image.frombuffer("RGBA", (tam, tam), buf, "raw", "BGRA", 0, 1).convert("RGB")
+        return ImageTk.PhotoImage(img)
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------------
@@ -1684,6 +1945,9 @@ class App:
             raise
         if AudioUtilities is None:
             self.log("Aviso: pycaw no está instalado; no se bajará el volumen de otros programas.")
+        self.restaurar_pendientes()
+        self.rep.persistir = lambda d: self.db.set_cfg(
+            "volumenes_pendientes", json.dumps(d) if d else "")
         self.rep.al_fallo = lambda a, motivo: self.marcar_problema(a["id"], motivo)
         self.rep.al_exito = self._audio_sono
         self.manual = self.db.cfg("modo_manual", "0") == "1"
@@ -1717,16 +1981,218 @@ class App:
     # ---------------- interfaz ----------------
     def construir_ui(self):
         nb = ttk.Notebook(self.root)
+        self.nb = nb
         nb.pack(fill="both", expand=True, padx=6, pady=6)
         self.tab_audios = ttk.Frame(nb)
         self.tab_cats = ttk.Frame(nb)
+        self.tab_apps = ttk.Frame(nb)
         self.tab_sis = ttk.Frame(nb)
         nb.add(self.tab_audios, text="  Audios  ")
         nb.add(self.tab_cats, text="  Categorías  ")
+        nb.add(self.tab_apps, text="  Apps  ")
         nb.add(self.tab_sis, text="  Sistema  ")
         self.ui_audios()
         self.ui_categorias()
+        self.ui_apps()
         self.ui_sistema()
+
+    # ---------------- pestaña Apps: quién usa el audio y a quién se atenúa ----------------
+    def restaurar_pendientes(self):
+        """Si el programa se cerró de golpe mientras atenuaba otras apps, esas apps se quedaron
+        con el volumen bajo (Windows lo recuerda por app): aquí se les devuelve al abrir."""
+        try:
+            pend = json.loads(self.db.cfg("volumenes_pendientes", "") or "{}")
+        except ValueError:
+            pend = {}
+        if not pend or AudioUtilities is None:
+            return
+        n = 0
+        try:
+            for s in AudioUtilities.GetAllSessions():
+                try:
+                    if s.Process is None:
+                        continue
+                    orig = pend.get(s.Process.name())
+                    v = s.SimpleAudioVolume
+                    if orig is not None and v.GetMasterVolume() < orig - 0.01:
+                        v.SetMasterVolume(float(orig), None)
+                        n += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        self.db.set_cfg("volumenes_pendientes", "")
+        if n:
+            self.log("Se devolvió su volumen a %d app(s) que quedaron atenuadas la vez anterior." % n)
+
+    def cfg_lista(self, clave):
+        try:
+            v = json.loads(self.db.cfg(clave, "[]"))
+            return v if isinstance(v, list) else []
+        except ValueError:
+            return []
+
+    def set_cfg_lista(self, clave, lista):
+        self.db.set_cfg(clave, json.dumps(lista))
+
+    def ui_apps(self):
+        f = self.tab_apps
+        ttk.Label(f, text="Apps de Windows que están usando el audio (como en el Mezclador de "
+                          "volumen). Cuando suena un audio con la opción «Bajar el volumen de las "
+                          "otras apps», las marcadas con «Sí» se atenúan y luego vuelven a su volumen.",
+                  wraplength=1000, foreground="#555555", justify="left").pack(
+            anchor="w", padx=10, pady=(10, 6))
+        marco = ttk.Frame(f)
+        marco.pack(fill="both", expand=True, padx=10)
+        cols = ("ventana", "vol", "estado", "atenuar")
+        self.tree_apps = ttk.Treeview(marco, columns=cols, selectmode="browse", height=12)
+        self.tree_apps.heading("#0", text="App")
+        for c, t, w in (("ventana", "Lo que se ve en su ventana", 380), ("vol", "Volumen", 80),
+                        ("estado", "Estado", 110), ("atenuar", "¿Atenuar?", 80)):
+            self.tree_apps.heading(c, text=t)
+            self.tree_apps.column(c, width=w, anchor="w" if c == "ventana" else "center")
+        self.tree_apps.column("#0", width=260)
+        sb = ttk.Scrollbar(marco, orient="vertical", command=self.tree_apps.yview)
+        self.tree_apps.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tree_apps.pack(side="left", fill="both", expand=True)
+        self.tree_apps.tag_configure("atenuada", background="#fdebd0")
+        self.tree_apps.tag_configure("no", foreground="#999999")
+        self.tree_apps.bind("<Double-1>", lambda e: self.alternar_app())
+        self.iconos_apps = {}                       # se guardan: si no, Tk los borra
+        self.lbl_apps = ttk.Label(f, text="", foreground="#1e64c8", font=("Segoe UI", 9, "bold"))
+        self.lbl_apps.pack(anchor="w", padx=10, pady=(6, 0))
+        bt = ttk.Frame(f)
+        bt.pack(anchor="w", padx=10, pady=8)
+        ttk.Button(bt, text="Atenuar sí / no", command=self.alternar_app).pack(side="left")
+        ttk.Button(bt, text="Añadir app a mano…", command=self.agregar_app_manual).pack(
+            side="left", padx=8)
+        ttk.Button(bt, text="Quitar de la lista", command=self.quitar_app_manual).pack(side="left")
+        ttk.Button(bt, text="Probar atenuación (4 s)", command=self.probar_atenuacion).pack(
+            side="left", padx=18)
+        ttk.Button(bt, text="Actualizar", command=self.refrescar_apps).pack(side="left")
+        ttk.Label(f, text="Si una app no aparece sola (por ejemplo no está sonando ahora), usa "
+                          "«Añadir app a mano» y elige su programa (.exe). Doble clic = Sí / No.",
+                  foreground="#888888").pack(anchor="w", padx=10)
+        self.root.after(2000, self._ciclo_apps)
+
+    def _ciclo_apps(self):
+        try:
+            if (self.nb.index("current") == self.nb.index(self.tab_apps)
+                    and self.root.winfo_viewable()):
+                self.refrescar_apps()
+        except tk.TclError:
+            pass
+        self.root.after(2000, self._ciclo_apps)
+
+    def _listar_apps(self):
+        """{nombre_proceso_en_minúsculas: datos} de las apps con audio y de las añadidas a mano."""
+        apps = {}
+        if AudioUtilities is not None:
+            try:
+                for s in AudioUtilities.GetAllSessions():
+                    try:
+                        if s.Process is None or s.ProcessId == os.getpid():
+                            continue
+                        nombre = s.Process.name()
+                        clave = nombre.lower()
+                        d = apps.setdefault(clave, dict(nombre=nombre, ruta=None, pid=s.ProcessId,
+                                                        vol=0.0, activo=False, manual=False))
+                        try:
+                            d["ruta"] = d["ruta"] or s.Process.exe()
+                        except Exception:
+                            pass
+                        d["vol"] = max(d["vol"], s.SimpleAudioVolume.GetMasterVolume())
+                        d["activo"] = d["activo"] or getattr(s, "State", 0) == 1
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        for ruta in self.cfg_lista("apps_manuales"):
+            clave = os.path.basename(ruta).lower()
+            d = apps.setdefault(clave, dict(nombre=os.path.basename(ruta), ruta=ruta, pid=None,
+                                            vol=None, activo=False, manual=True))
+            d["manual"] = True
+            d["ruta"] = d["ruta"] or ruta
+        return apps
+
+    def refrescar_apps(self):
+        apps = self._listar_apps()
+        excluidas = set(self.cfg_lista("apps_excluir"))
+        atenuadas = {n.lower() for n in self.rep.atenuadas()}
+        sel = self.tree_apps.selection()
+        self.tree_apps.delete(*self.tree_apps.get_children())
+        for clave, d in sorted(apps.items(), key=lambda x: (not x[1]["activo"], x[0])):
+            ruta = d["ruta"]
+            if ruta and ruta not in self.iconos_apps:
+                self.iconos_apps[ruta] = icono_exe(ruta)
+            nombre = (descripcion_exe(ruta) if ruta else None) or d["nombre"].rsplit(".", 1)[0]
+            ventana = (titulo_ventana(d["pid"]) if d["pid"] else None) or ""
+            if clave in atenuadas:
+                estado = "Atenuada"
+            elif d["activo"]:
+                estado = "Sonando"
+            elif d["vol"] is None:
+                estado = "Sin sesión"
+            else:
+                estado = "En silencio"
+            tags = (["atenuada"] if clave in atenuadas else []) + (["no"] if clave in excluidas else [])
+            kw = dict(image=self.iconos_apps[ruta]) if ruta and self.iconos_apps.get(ruta) else {}
+            self.tree_apps.insert("", "end", iid=clave, text="  " + nombre, tags=tags, values=(
+                ventana[:70], "" if d["vol"] is None else "%d%%" % round(d["vol"] * 100), estado,
+                "No" if clave in excluidas else "Sí"), **kw)
+        for s_ in sel:
+            if self.tree_apps.exists(s_):
+                self.tree_apps.selection_set(s_)
+        if atenuadas:
+            self.lbl_apps.config(text="Atenuando ahora: " + ", ".join(sorted(self.rep.atenuadas())))
+        else:
+            self.lbl_apps.config(text="" if apps else
+                                 "No se detecta ninguna app usando el audio en este momento.")
+
+    def alternar_app(self):
+        s = self.tree_apps.selection()
+        if not s:
+            return
+        excl = self.cfg_lista("apps_excluir")
+        if s[0] in excl:
+            excl.remove(s[0])
+        else:
+            excl.append(s[0])
+        self.set_cfg_lista("apps_excluir", excl)
+        self.rep.apps_excluir = set(excl)
+        self.refrescar_apps()
+
+    def agregar_app_manual(self):
+        ruta = filedialog.askopenfilename(
+            parent=self.root, title="Elige el programa (.exe) cuyo audio quieres atenuar",
+            filetypes=[("Programas", "*.exe"), ("Todos", "*.*")])
+        if ruta:
+            lista = self.cfg_lista("apps_manuales")
+            if ruta not in lista:
+                lista.append(ruta)
+                self.set_cfg_lista("apps_manuales", lista)
+            self.refrescar_apps()
+
+    def quitar_app_manual(self):
+        s = self.tree_apps.selection()
+        if not s:
+            return
+        lista = self.cfg_lista("apps_manuales")
+        nueva = [r for r in lista if os.path.basename(r).lower() != s[0]]
+        if len(nueva) == len(lista):
+            messagebox.showinfo("Apps", "Esta app se detecta sola; solo se pueden quitar las "
+                                "añadidas a mano. Si no quieres que se atenúe, ponla en «No».",
+                                parent=self.root)
+            return
+        self.set_cfg_lista("apps_manuales", nueva)
+        self.refrescar_apps()
+
+    def probar_atenuacion(self):
+        """Baja el volumen de las apps marcadas durante 4 s, para comprobar que se detectan."""
+        self.rep.forzar_atenuar_hasta = time.time() + 4.0
+        self.root.after(1200, self.refrescar_apps)
+        self.root.after(5600, self.refrescar_apps)
 
     def ui_audios(self):
         f = self.tab_audios
@@ -1945,8 +2411,8 @@ class App:
         ttk.Button(fh, text="Programar", command=self.programar_apertura).pack(side="left", padx=3)
         ttk.Button(fh, text="Quitar", command=self.quitar_apertura).pack(side="left", padx=3)
 
-        fv = ttk.LabelFrame(f, text="Prioridad y damper (bajar el volumen mientras suena "
-                                    "un audio con prioridad)", padding=8)
+        fv = ttk.LabelFrame(f, text="Damper (bajar el volumen de las otras apps y del audio en "
+                                    "curso mientras suena un audio)", padding=8)
         fv.pack(fill="x", pady=6)
         self.v_pct = tk.StringVar(value=self.db.cfg("bajar_pct", "25"))
         self.v_rampa = tk.StringVar(value=self.db.cfg("damper_rampa", "1.5"))
@@ -2364,6 +2830,7 @@ class App:
         r.tope = self.v_tope.get()
         activa, _, techo = self.cfg_norm()
         r.usar_norm, r.techo = activa, techo
+        r.apps_excluir = set(self.cfg_lista("apps_excluir"))
 
     def guardar_damper(self):
         s = self.db.set_cfg
@@ -3255,8 +3722,71 @@ class App:
         self.root.after(500, self.tick)
 
 
+def diagnostico(rutas):
+    """Audiomatico.exe --diagnostico archivo.mp3 ...  Escribe diagnostico.txt (en la carpeta de
+    datos) con qué decodificadores hay y si cada audio se puede leer, medir y reproducir."""
+    os.makedirs(CARPETA, exist_ok=True)
+    lin = ["%s %s - diagnóstico del %s" % (NOMBRE, VERSION, time.strftime("%Y-%m-%d %H:%M:%S")),
+           "Python %s %s" % (sys.version.split()[0], "(64 bits)" if sys.maxsize > 2 ** 32 else "(32 bits)"),
+           "pygame %s (SDL %s, SDL_mixer %s)" % (
+               pygame.version.ver, ".".join(map(str, pygame.version.SDL)),
+               ".".join(map(str, pygame.mixer.get_sdl_mixer_version()))),
+           "miniaudio: %s | psutil: %s | pycaw: %s" % (
+               "sí" if miniaudio else "NO", "sí" if psutil else "NO", "sí" if AudioUtilities else "NO")]
+    try:
+        try:
+            pygame.mixer.init(44100, -16, 2, 2048, allowedchanges=0)
+        except Exception:
+            pygame.mixer.quit()
+            pygame.mixer.init()
+        lin.append("Mezcla de audio: %s" % (pygame.mixer.get_init(),))
+    except Exception as e:
+        lin.append("No se pudo iniciar la tarjeta de sonido: %s" % motivo_error(e))
+    for r in rutas:
+        lin += ["", "Archivo: " + r]
+        try:
+            lin.append("  Tamaño: %.1f KB | duración según su cabecera: %s" % (
+                os.path.getsize(r) / 1024.0, ("%.1f s" % mp3_segundos(r)) if mp3_segundos(r) else "?"))
+        except OSError as e:
+            lin.append("  No se puede abrir el archivo: %s" % e)
+            continue
+        for nombre, f in (("pygame Sound (lo usa el nivelador)", lambda: pygame.mixer.Sound(r)),
+                          ("pygame music (la reproducción)", lambda: pygame.mixer.music.load(r))):
+            try:
+                f()
+                lin.append("  %-36s OK" % nombre)
+            except Exception as e:
+                lin.append("  %-36s FALLA: %s" % (nombre, motivo_error(e)))
+        dur, env, nivel, motivo = analizar_audio(r)
+        if motivo:
+            lin.append("  Análisis completo                    FALLA: %s" % motivo)
+        else:
+            lin.append("  Análisis completo                    OK: dura %.1f s, nivel medio %s" % (
+                dur, "%.1f dB" % nivel if nivel is not None else "sin sonido"))
+    lin += ["", "Apps de Windows con audio ahora mismo:"]
+    try:
+        apps = sorted({s.Process.name() for s in AudioUtilities.GetAllSessions()
+                       if s.Process is not None and s.ProcessId != os.getpid()})
+        lin += ["  " + a for a in apps] or ["  (ninguna)"]
+    except Exception as e:
+        lin.append("  no se pudo listar: %s" % motivo_error(e))
+    ruta_txt = os.path.join(CARPETA, "diagnostico.txt")
+    with open(ruta_txt, "w", encoding="utf-8") as f:
+        f.write("\n".join(lin) + "\n")
+    try:
+        r = tk.Tk()
+        r.withdraw()
+        messagebox.showinfo(NOMBRE, "Diagnóstico guardado en:\n%s" % ruta_txt)
+        r.destroy()
+    except Exception:
+        pass
+
+
 def main():
     global PUERTO
+    if "--diagnostico" in sys.argv:
+        diagnostico(sys.argv[sys.argv.index("--diagnostico") + 1:])
+        return
     if "--puerto" in sys.argv:          # solo para pruebas: permite abrir una segunda copia
         PUERTO = int(sys.argv[sys.argv.index("--puerto") + 1])
     minimizado = "--minimizado" in sys.argv
