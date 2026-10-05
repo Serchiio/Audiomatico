@@ -6,3 +6,4 @@ Pillow==9.5.0
 psutil==5.9.8
 certifi==2024.8.30
 miniaudio==1.61
+winsdk==1.0.0b10

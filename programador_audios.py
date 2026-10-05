@@ -51,7 +51,7 @@ except Exception:
 
 APP = "ProgramadorAudios"   # nombre interno: carpeta de datos, registro y tarea (no cambiar)
 NOMBRE = "Audiomático"      # nombre que ve el usuario
-VERSION = "1.3.0"           # igual que en instalador.iss
+VERSION = "1.4.0"           # igual que en instalador.iss
 # colores de categoría (se asignan solos, rotando) y fuente exclusiva de la prioridad
 PALETA = ["#d9534f", "#f0ad4e", "#5cb85c", "#3ea6c4", "#6f7bd9", "#a463c9", "#e0679a",
           "#8d6e63"]
@@ -1166,6 +1166,16 @@ class Reproductor:
         if 0 <= i < len(self.cola):
             self.cola.pop(i)
 
+    def adelantar(self, i):
+        """Pone a sonar ya el audio i de la cola (salta lo que suene y la espera)."""
+        if 0 <= i < len(self.cola):
+            self.cola.insert(0, self.cola.pop(i))
+            self.espera_hasta = 0.0
+            if self.actual is not None:
+                self.detener_actual()
+            else:
+                self.siguiente_normal()
+
     # ---------- consulta (para la pantalla) ----------
     def sonando(self):
         """(audio principal, segundos, duración, audio atenuado de fondo)."""
@@ -1225,6 +1235,11 @@ class Reproductor:
                     and not pygame.mixer.music.get_busy()):
                 self.actual = None
                 self.env = []
+                # entre dos audios normales (por ejemplo, dos programados a la misma hora) también
+                # se respeta la espera; los de prioridad no esperan (para eso son prioridad)
+                if self.cola and self.espera > 0 and self.prio_actual is None:
+                    self.espera_hasta = time.time() + self.espera
+                    self.log("Esperando %d s antes de: %s" % (self.espera, self.cola[0]["nombre"]))
             if self.actual is None:
                 self.siguiente_normal()
         # 2) damper con rampa
@@ -1290,7 +1305,8 @@ class Reproductor:
             conocidas = {pid for pid, _, _, _ in self.sesiones}
             for s in AudioUtilities.GetAllSessions():
                 try:
-                    if s.Process is None or s.ProcessId == os.getpid() or s.ProcessId in conocidas:
+                    if (s.Process is None or s.ProcessId == os.getpid() or s.ProcessId in conocidas
+                            or es_sonido_sistema(s)):
                         continue
                     nombre = s.Process.name()
                     if nombre.lower() in self.apps_excluir:
@@ -1752,6 +1768,16 @@ except Exception:
     psutil = None
 
 
+def es_sonido_sistema(s):
+    """True si una sesión de audio es la de 'Sonidos del sistema' (avisos y notificaciones de
+    Windows): esa nunca se atenúa ni se lista."""
+    try:
+        return ("audiosrv.dll" in (s.DisplayName or "").lower()
+                or "audiosrv.dll" in (s.Identifier or "").lower())
+    except Exception:
+        return False
+
+
 def descripcion_exe(ruta):
     """Descripción de un programa (ej. 'Google Chrome') leída de su .exe, o None."""
     try:
@@ -1869,6 +1895,172 @@ def icono_exe(ruta, tam=20):
 
 
 # ----------------------------------------------------------------------
+# Qué suena en otras apps: título limpio y, en Windows 10/11, posición y duración
+# ----------------------------------------------------------------------
+try:
+    from pycaw.pycaw import IAudioMeterInformation
+except Exception:
+    IAudioMeterInformation = None
+try:      # controles multimedia de Windows 10/11 (no existen en Windows 7: queda en None)
+    from winsdk.windows.media.control import (
+        GlobalSystemMediaTransportControlsSessionManager as _GSMTC)
+except Exception:
+    _GSMTC = None
+
+_NOMBRES_SERVICIOS = {
+    "youtube music", "youtube", "spotify", "soundcloud", "deezer", "tidal", "apple music",
+    "amazon music", "brave", "google chrome", "chrome", "microsoft edge", "edge",
+    "mozilla firefox", "firefox", "opera", "vivaldi", "vlc media player", "vlc", "winamp",
+    "itunes", "tunein", "reproductor de windows media", "google play música",
+    "google play music", "groove música"}
+
+
+def limpiar_titulo(titulo, extras=()):
+    """'YouTube Music - Mi canción | YouTube Music' -> 'Mi canción': quita el nombre del
+    servicio y del navegador y deja solo el título."""
+    if not titulo:
+        return ""
+    ignorar = _NOMBRES_SERVICIOS | {e.lower() for e in extras if e}
+    partes = []
+    for bloque in titulo.split(" | "):
+        for p in re.split(r"\s+[-–—]\s+", bloque):
+            p = p.strip()
+            if p and p.lower() not in ignorar and p not in partes:
+                partes.append(p)
+    return " – ".join(partes) if partes else titulo
+
+
+class LectorMedios(threading.Thread):
+    """Lee cada segundo qué suena en las apps con los controles multimedia de Windows 10/11
+    (título, artista, posición y duración). Corre en su propio hilo; el resto del programa
+    solo mira la lista 'datos'."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.datos = []
+        self.error = None
+
+    def run(self):
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._bucle())
+        except Exception as e:
+            self.error = motivo_error(e)
+
+    async def _bucle(self):
+        import asyncio
+        import datetime
+        mgr = await _GSMTC.request_async()
+        while True:
+            lista = []
+            try:
+                for s in mgr.get_sessions():
+                    try:
+                        info = await s.try_get_media_properties_async()
+                        tl = s.get_timeline_properties()
+                        suena = "PLAYING" in str(s.get_playback_info().playback_status)
+                        pos = tl.position.total_seconds()
+                        dur = (tl.end_time - tl.start_time).total_seconds()
+                        if suena and tl.last_updated_time:          # la posición es de hace un momento
+                            ult = tl.last_updated_time
+                            ahora = datetime.datetime.now(ult.tzinfo) if ult.tzinfo else datetime.datetime.utcnow()
+                            pos += max(0.0, (ahora - ult).total_seconds())
+                        lista.append(dict(app=s.source_app_user_model_id or "", titulo=info.title or "",
+                                          artista=info.artist or "", pos=pos, dur=dur,
+                                          suena=suena, t=time.time()))
+                    except Exception:
+                        continue
+            except Exception as e:
+                self.error = motivo_error(e)
+            self.datos = lista
+            await asyncio.sleep(1.0)
+
+
+# ----------------------------------------------------------------------
+# Vúmetro estilo DJ (se usa para los audios del programa y para la app que se sigue)
+# ----------------------------------------------------------------------
+class Vumetro:
+    """Barra de segmentos en un Canvas: nivel de salida (color), sombra con el nivel original,
+    marca de pico y una línea de 'tope' que se puede mover."""
+
+    def __init__(self, canvas, top=16, alto=24, y_etiq=52, cap=(9, 43)):
+        self.c, self.top, self.alto, self.y_etiq, self.cap_y = canvas, top, alto, y_etiq, cap
+        self.segs, self.thr, self.estado = [], [], []
+        self.out = self.org = self.pico = VU_MIN
+        self.pico_t = 0.0
+        self.tope, self.color_tope = None, "#ffffff"
+        canvas.bind("<Configure>", self.construir)
+
+    @staticmethod
+    def color_seg(db):
+        """(encendido, sombra) de un segmento según su nivel."""
+        if db <= -14:
+            return "#2ecc71", "#2f5f40"
+        if db <= -5:
+            return "#f1c40f", "#665c2a"
+        return "#e74c3c", "#663030"
+
+    def x(self, db):
+        db = max(VU_MIN, min(VU_MAX, db))
+        return self.x0 + (db - VU_MIN) / (VU_MAX - VU_MIN) * (self.x1 - self.x0)
+
+    def construir(self, e=None):
+        c = self.c
+        c.delete("all")
+        w = max(80, c.winfo_width())
+        self.x0, self.x1 = 8, w - 8
+        ancho = (self.x1 - self.x0) / float(VU_SEGS)
+        self.segs, self.thr = [], []
+        for i in range(VU_SEGS):
+            x = self.x0 + i * ancho
+            self.segs.append(c.create_rectangle(x + 1, self.top, x + ancho - 1, self.top + self.alto,
+                                                fill="#262b32", outline=""))
+            self.thr.append(VU_MIN + (i + 0.5) * (VU_MAX - VU_MIN) / VU_SEGS)
+        for db in (-60, -40, -20, -10, -5, 0):
+            c.create_text(self.x(db), self.y_etiq, text=str(db), fill="#8a939e", font=("Segoe UI", 7))
+        self.linea = c.create_line(0, self.cap_y[0], 0, self.cap_y[1], fill="#ffffff", width=2)
+        self.estado = [None] * VU_SEGS
+        self.dibujar()
+
+    def actualizar(self, out, org, dt, ahora, tope=None, color_tope="#ffffff"):
+        caida = 45.0 * dt                         # dB por segundo que baja la barra
+        self.out = out if out > self.out else max(out, self.out - caida)
+        self.org = org if org > self.org else max(org, self.org - caida)
+        if self.out >= self.pico:
+            self.pico, self.pico_t = self.out, ahora
+        elif ahora - self.pico_t > 0.8:
+            self.pico = max(self.out, self.pico - 30.0 * dt)
+        self.tope, self.color_tope = tope, color_tope
+        self.dibujar()
+
+    def dibujar(self):
+        if not self.segs:
+            return
+        i_pico = None
+        if self.pico > VU_MIN + 1:
+            i_pico = min(VU_SEGS - 1, int((self.pico - VU_MIN) / (VU_MAX - VU_MIN) * VU_SEGS))
+        for i, thr in enumerate(self.thr):
+            on, sombra = self.color_seg(thr)
+            if i == i_pico:
+                col = "#ffffff"
+            elif thr <= self.out:
+                col = on
+            elif thr <= self.org:
+                col = sombra
+            else:
+                col = "#262b32"
+            if col != self.estado[i]:
+                self.estado[i] = col
+                self.c.itemconfig(self.segs[i], fill=col)
+        if self.tope is not None:
+            x = self.x(self.tope)
+            self.c.coords(self.linea, x, self.cap_y[0], x, self.cap_y[1])
+            self.c.itemconfig(self.linea, fill=self.color_tope)
+
+
+# ----------------------------------------------------------------------
 # Visor del registro de eventos (reemplaza la antigua pestaña Estado)
 # ----------------------------------------------------------------------
 class VisorRegistro(tk.Toplevel):
@@ -1924,6 +2116,14 @@ class App:
         self.colores = {}
         self.proximos = []
         self.manual = False
+        self.omitidas = set()               # (id de audio, 'AAAA-MM-DD HH:MM') que se saltan una vez
+        self.lector = None                  # hilo que lee la canción de otras apps (Windows 10/11)
+        self.app_clave = ""                 # app que se sigue en la pantalla principal
+        self.app_meter = self.app_vol = self.app_pid = self.app_smtc = None
+        self.app_t_lento = 0.0
+        self.app_tit_prev = None
+        self.app_titulo = self.app_artista = ""
+        self.app_t0 = time.time()
         self._nivelando = False
         self.cola_nivelar = []
         global FORMATO_12H
@@ -1935,8 +2135,8 @@ class App:
             self.root.iconbitmap(recurso("icono.ico"))
         except Exception:
             pass
-        self.root.geometry("1200x680")
-        self.root.minsize(900, 600)
+        self.root.geometry("1200x740")
+        self.root.minsize(900, 640)
         try:
             estilo = ttk.Style()
             estilo.theme_use("vista")
@@ -1970,6 +2170,11 @@ class App:
         # último minuto ya ejecutado: si el programa se reinicia en ese mismo minuto
         # (por ejemplo al actualizarse) no vuelve a lanzar los audios de ese minuto
         self.ultimo_minuto = self.db.cfg("ultimo_minuto", "") or None
+        self.omitidas = {(int(a), b) for a, b in self.cfg_lista("omitidas")}
+        if _GSMTC is not None:              # Windows 10/11: título, posición y duración de otras apps
+            self.lector = LectorMedios()
+            self.lector.start()
+        self.seguir_app(self.db.cfg("app_seguir", ""))
         self.refrescar_categorias()
         self.refrescar_audios()
         self.cola_nivelar = []
@@ -2074,6 +2279,7 @@ class App:
         self.tree_apps.tag_configure("atenuada", background="#fdebd0")
         self.tree_apps.tag_configure("no", foreground="#999999")
         self.tree_apps.bind("<Double-1>", lambda e: self.alternar_app())
+        self.tree_apps.bind("<<TreeviewSelect>>", lambda e: self._app_elegida())
         self.iconos_apps = {}                       # se guardan: si no, Tk los borra
         self.lbl_apps = ttk.Label(f, text="", foreground="#1e64c8", font=("Segoe UI", 9, "bold"))
         self.lbl_apps.pack(anchor="w", padx=10, pady=(6, 0))
@@ -2086,9 +2292,14 @@ class App:
         ttk.Button(bt, text="Probar atenuación (4 s)", command=self.probar_atenuacion).pack(
             side="left", padx=18)
         ttk.Button(bt, text="Actualizar", command=self.refrescar_apps).pack(side="left")
-        ttk.Label(f, text="Si una app no aparece sola (por ejemplo no está sonando ahora), usa "
-                          "«Añadir app a mano» y elige su programa (.exe). Doble clic = Sí / No.",
-                  foreground="#888888").pack(anchor="w", padx=10)
+        ttk.Button(bt, text="Dejar de mostrar en pantalla principal",
+                   command=lambda: self.seguir_app("")).pack(side="left", padx=18)
+        ttk.Label(f, text="Al elegir una app (un clic) aparece en la pantalla principal con la "
+                          "canción, su línea de reproducción y su medidor en vivo; la línea blanca "
+                          "baja (naranja) cuando se atenúa.\nSi una app no aparece sola (no está "
+                          "sonando ahora), usa «Añadir app a mano» y elige su programa (.exe). "
+                          "Doble clic = atenuar Sí / No.",
+                  foreground="#888888", justify="left").pack(anchor="w", padx=10)
         self.root.after(2000, self._ciclo_apps)
 
     def _ciclo_apps(self):
@@ -2107,7 +2318,7 @@ class App:
             try:
                 for s in AudioUtilities.GetAllSessions():
                     try:
-                        if s.Process is None or s.ProcessId == os.getpid():
+                        if s.Process is None or s.ProcessId == os.getpid() or es_sonido_sistema(s):
                             continue
                         nombre = s.Process.name()
                         clave = nombre.lower()
@@ -2156,14 +2367,24 @@ class App:
             self.tree_apps.insert("", "end", iid=clave, text="  " + nombre, tags=tags, values=(
                 ventana[:70], "" if d["vol"] is None else "%d%%" % round(d["vol"] * 100), estado,
                 "No" if clave in excluidas else "Sí"), **kw)
-        for s_ in sel:
+        for s_ in (sel or ([self.app_clave] if self.app_clave else [])):
             if self.tree_apps.exists(s_):
+                self._ignorar_sel_app = True
                 self.tree_apps.selection_set(s_)
         if atenuadas:
             self.lbl_apps.config(text="Atenuando ahora: " + ", ".join(sorted(self.rep.atenuadas())))
         else:
             self.lbl_apps.config(text="" if apps else
                                  "No se detecta ninguna app usando el audio en este momento.")
+
+    def _app_elegida(self):
+        """Un clic en una app de la lista: pasa a verse en la pantalla principal."""
+        if getattr(self, "_ignorar_sel_app", False):       # selección puesta por el programa
+            self._ignorar_sel_app = False
+            return
+        s = self.tree_apps.selection()
+        if s:
+            self.seguir_app(s[0])
 
     def alternar_app(self):
         s = self.tree_apps.selection()
@@ -2320,13 +2541,37 @@ class App:
         # vúmetro estilo DJ
         self.cv_vu = tk.Canvas(der, height=64, bg=VU_FONDO, highlightthickness=0, bd=0)
         self.cv_vu.pack(fill="x")
-        self.cv_vu.bind("<Configure>", self.construir_vu)
+        self.vu = Vumetro(self.cv_vu)
         self.lbl_db = ttk.Label(der, text="", foreground="#444444")
-        self.lbl_db.pack(anchor="w", pady=(3, 0))
-        ttk.Label(der, text="Sombreado = nivel original, antes de nivelar",
-                  foreground="#999999", font=("Segoe UI", 8)).pack(anchor="w", pady=(0, 8))
+        self.lbl_db.pack(anchor="w", pady=(3, 6))
+
+        # --- la app que se sigue (se elige en la pestaña Apps): canción, línea y medidor ---
+        self.fr_app = ttk.LabelFrame(der, text="App seleccionada", padding=(8, 2, 8, 4))
+        fa = ttk.Frame(self.fr_app)
+        fa.pack(fill="x")
+        self.lbl_app_icono = tk.Label(fa, bd=0)
+        self.lbl_app_icono.pack(side="left")
+        self.lbl_app_nombre = ttk.Label(fa, text="", font=("Segoe UI", 8, "bold"),
+                                        foreground="#555555")
+        self.lbl_app_nombre.pack(side="left", padx=(4, 0))
+        self.lbl_app_estado = ttk.Label(fa, text="", font=("Segoe UI", 8, "bold"))
+        self.lbl_app_estado.pack(side="right")
+        self.lbl_app_cancion = ttk.Label(self.fr_app, text="", font=("Segoe UI", 10, "bold"))
+        self.lbl_app_cancion.pack(anchor="w", fill="x")
+        self.cv_app_prog = tk.Canvas(self.fr_app, height=14, bg=fondo, highlightthickness=0, bd=0)
+        self.cv_app_prog.pack(fill="x", pady=(2, 0))
+        self.lbl_app_tiempo = ttk.Label(self.fr_app, text="", foreground="#666666")
+        self.lbl_app_tiempo.pack(anchor="e")
+        self.cv_app_vu = tk.Canvas(self.fr_app, height=46, bg=VU_FONDO, highlightthickness=0, bd=0)
+        self.cv_app_vu.pack(fill="x")
+        self.vu_app = Vumetro(self.cv_app_vu, top=8, alto=18, y_etiq=36, cap=(3, 29))
+        self.lbl_app_nota = ttk.Label(self.fr_app, text="", font=("Segoe UI", 8),
+                                      foreground="#666666")
+        self.lbl_app_nota.pack(anchor="w")
+
         # --- abajo: la cola (izquierda) y el mezclador de dos faders (derecha) ---
         abajo = ttk.Frame(der)
+        self.fr_abajo = abajo
         abajo.pack(fill="both", expand=True)
 
         mezcla = ttk.Frame(abajo)
@@ -2376,16 +2621,25 @@ class App:
         self.lb_cola_main.bind("<ButtonPress-1>", self.cola_press)
         self.lb_cola_main.bind("<B1-Motion>", self.cola_drag)
         self.cola_origen = None
+        # los controles se empaquetan ABAJO primero: así nunca se cortan; la lista usa lo que sobra
+        self.lbl_ayuda_cola = ttk.Label(izqc, text="Elige un audio de la lista.",
+                                        foreground="#888888", font=("Segoe UI", 8),
+                                        wraplength=215, justify="left")
+        self.lbl_ayuda_cola.pack(side="bottom", anchor="w", pady=(2, 0))
         fb = ttk.Frame(izqc)
-        fb.pack(fill="x", pady=(6, 0))
-        ttk.Button(fb, text="▲", width=3,
-                   command=lambda: self.mover_sel(-1)).pack(side="left")
-        ttk.Button(fb, text="▼", width=3,
-                   command=lambda: self.mover_sel(1)).pack(side="left", padx=3)
-        ttk.Button(fb, text="Quitar",
-                   command=self.quitar_sel).pack(side="left")
-        ttk.Label(izqc, text="Arrastra para cambiar el orden",
-                  foreground="#888888").pack(anchor="w", pady=(4, 0))
+        fb.pack(side="bottom", fill="x", pady=(4, 0))
+        self.btn_sube = ttk.Button(fb, text="▲", width=3, command=lambda: self.mover_sel(-1))
+        self.btn_sube.pack(side="left")
+        self.btn_baja = ttk.Button(fb, text="▼", width=3, command=lambda: self.mover_sel(1))
+        self.btn_baja.pack(side="left", padx=2)
+        self.btn_ahora = ttk.Button(fb, text="▶ Ahora", width=8, command=self.ahora_sel)
+        self.btn_ahora.pack(side="left")
+        self.btn_quitar = ttk.Button(fb, text="Quitar", width=8, command=self.quitar_sel)
+        self.btn_quitar.pack(side="left", padx=(2, 0))
+        self.lb_cola_main.pack_forget()
+        self.lb_cola_main.pack(fill="both", expand=True, pady=(2, 0))
+        self.lb_cola_main.bind("<<TreeviewSelect>>", lambda e: self.actualizar_botones_cola())
+        self.root.after(200, self.actualizar_botones_cola)
 
     def ui_categorias(self):
         f = self.tab_cats
@@ -2593,8 +2847,8 @@ class App:
         color = self.colores.get(a["categoria_id"]) if a is not None else None
         self.dibujar_progreso(frac, color or "#1e64c8")      # la barra toma el color de la categoría
 
-    def dibujar_progreso(self, frac, color):
-        c = self.cv_prog
+    def dibujar_progreso(self, frac, color, c=None):
+        c = c or self.cv_prog
         w = max(40, c.winfo_width())
         c.delete("all")
         c.create_line(8, 8, w - 8, 8, width=6, capstyle="round", fill="#d5dae1")
@@ -2603,92 +2857,39 @@ class App:
             c.create_line(8, 8, max(x, 9), 8, width=6, capstyle="round", fill=color)
             c.create_oval(x - 6, 2, x + 6, 14, fill="white", outline=color, width=2)
 
-    # --- vúmetro ---
-    @staticmethod
-    def _color_seg(db):
-        """(encendido, sombra) de un segmento según su nivel."""
-        if db <= -14:
-            return "#2ecc71", "#2f5f40"
-        if db <= -5:
-            return "#f1c40f", "#665c2a"
-        return "#e74c3c", "#663030"
-
-    def _x_vu(self, db):
-        db = max(VU_MIN, min(VU_MAX, db))
-        return self.vu_x0 + (db - VU_MIN) / (VU_MAX - VU_MIN) * (self.vu_x1 - self.vu_x0)
-
-    def construir_vu(self, e=None):
-        c = self.cv_vu
-        c.delete("all")
-        w = max(80, c.winfo_width())
-        self.vu_x0, self.vu_x1 = 8, w - 8
-        ancho = (self.vu_x1 - self.vu_x0) / float(VU_SEGS)
-        self.vu_segs, self.vu_thr = [], []
-        for i in range(VU_SEGS):
-            db = VU_MIN + (i + 0.5) * (VU_MAX - VU_MIN) / VU_SEGS
-            x = self.vu_x0 + i * ancho
-            self.vu_segs.append(c.create_rectangle(x + 1, 16, x + ancho - 1, 40,
-                                                   fill="#262b32", outline=""))
-            self.vu_thr.append(db)
-        for db in (-60, -40, -20, -10, -5, 0):
-            c.create_text(self._x_vu(db), 52, text=str(db), fill="#8a939e",
-                          font=("Segoe UI", 7))
-        self.vu_cap = c.create_line(0, 9, 0, 43, fill="#ffffff", width=2)
-        self.vu_seg_estado = [None] * VU_SEGS
-        self.dibujar_vu()
-
-    def dibujar_vu(self):
-        if not self.vu_segs:
-            return
-        c = self.cv_vu
-        out, org, pico = self.vu_out, self.vu_org, self.vu_pico
-        i_pico = None
-        if pico > VU_MIN + 1:
-            i_pico = min(VU_SEGS - 1, int((pico - VU_MIN) / (VU_MAX - VU_MIN) * VU_SEGS))
-        for i, thr in enumerate(self.vu_thr):
-            on, sombra = self._color_seg(thr)
-            if i == i_pico:
-                col = "#ffffff"
-            elif thr <= out:
-                col = on
-            elif thr <= org:
-                col = sombra
-            else:
-                col = "#262b32"
-            if col != self.vu_seg_estado[i]:
-                self.vu_seg_estado[i] = col
-                c.itemconfig(self.vu_segs[i], fill=col)
-        x = self._x_vu(self.rep.tope)       # la línea blanca sigue al fader TOPE
-        c.coords(self.vu_cap, x, 9, x, 43)
-
     def animar(self):
-        """Bucle rápido (25 cuadros/s): vúmetro y barra de progreso."""
+        """Bucle rápido (25 cuadros/s): vúmetros y barras de progreso."""
         if not self.root.winfo_viewable():       # ventana oculta: no gastar CPU
             self.root.after(300, self.animar)
             return
-        ahora = time.time()
-        dt_ = min(0.2, ahora - self.vu_t)
-        self.vu_t = ahora
-        n = self.rep.niveles()
-        meta_out, meta_org = (VU_MIN, VU_MIN) if n is None else n
-        caida = 45.0 * dt_                        # dB por segundo que baja la barra
-        self.vu_out = meta_out if meta_out > self.vu_out else max(meta_out, self.vu_out - caida)
-        self.vu_org = meta_org if meta_org > self.vu_org else max(meta_org, self.vu_org - caida)
-        if self.vu_out >= self.vu_pico:
-            self.vu_pico, self.vu_pico_t = self.vu_out, ahora
-        elif ahora - self.vu_pico_t > 0.8:
-            self.vu_pico = max(self.vu_out, self.vu_pico - 30.0 * dt_)
-        self.dibujar_vu()
-        if n is None:
-            txt = "Salida: --   Original: --"
-        else:
-            txt = "Salida: %.0f dB   Original: %.0f dB%s" % (
-                n[0], n[1], "   (limitado)" if n[1] - n[0] > 1.5 else "")
-        if txt != self.lbl_db.cget("text"):
-            self.lbl_db.config(text=txt)
-        self.actualizar_progreso()
+        try:
+            ahora = time.time()
+            dt_ = min(0.2, ahora - self.vu_t)
+            self.vu_t = ahora
+            n = self.rep.niveles()
+            meta_out, meta_org = (VU_MIN, VU_MIN) if n is None else n
+            self.vu.actualizar(meta_out, meta_org, dt_, ahora, self.rep.tope)   # la línea sigue al TOPE
+            if n is None:
+                txt = "Salida: --   Original: --"
+            else:
+                txt = "Salida: %.0f dB   Original: %.0f dB%s" % (
+                    n[0], n[1], "   (limitado)" if n[1] - n[0] > 1.5 else "")
+            if txt != self.lbl_db.cget("text"):
+                self.lbl_db.config(text=txt)
+            self.actualizar_progreso()
+        except Exception as e:                   # un fallo en un cuadro no debe parar la animación
+            self._avisar_animacion(e)
+        try:
+            self.animar_app(time.time(), 0.04)
+        except Exception as e:
+            self._avisar_animacion(e)
         self.root.after(40, self.animar)
 
+    def _avisar_animacion(self, e):
+        clave = motivo_error(e)
+        if clave != getattr(self, "_ult_error_anim", None):      # una sola línea por tipo de error
+            self._ult_error_anim = clave
+            self.log("Error al dibujar la pantalla (se sigue funcionando): " + clave)
     def ajustar_divisor(self, e=None):
         """Deja el panel de la cola a la derecha con ~340 px, al tener tamaño real."""
         w = self.panel.winfo_width()
@@ -2700,9 +2901,9 @@ class App:
         except tk.TclError:
             pass
 
-    # --- reordenar la cola ---
+    # --- la cola y los próximos audios: qué se puede hacer con cada fila ---
     def _idx_cola(self, fila):
-        """Fila del listbox -> posición en rep.cola (None si es una prioridad en espera)."""
+        """Fila de la lista -> posición en rep.cola (None si no es un audio de la cola)."""
         i = fila - len(self.rep.cola_prio)
         return i if 0 <= i < len(self.rep.cola) else None
 
@@ -2712,6 +2913,7 @@ class App:
         hijos = self.lb_cola_main.get_children()
         if seleccionar is not None and 0 <= seleccionar < len(hijos):
             self.lb_cola_main.selection_set(hijos[seleccionar])
+        self.actualizar_botones_cola()
 
     def _fila_cola(self, item):
         return self.lb_cola_main.index(item) if item else None
@@ -2733,24 +2935,220 @@ class App:
         self.cola_origen = fila
         self._redibujar_cola(fila)
 
-    def _sel_cola(self):
+    def _tipo_sel(self):
+        """(tipo, índice) de la fila elegida: 'prio' (prioridad en espera), 'cola' (le tocaba
+        sonar y espera su turno) o 'prog' (programado más adelante). (None, None) si no hay."""
         s = self.lb_cola_main.selection()
-        return self._fila_cola(s[0]) if s else None
+        if not s:
+            return None, None
+        fila = self._fila_cola(s[0])
+        n_prio = len(self.rep.cola_prio)
+        n_cola = n_prio + len(self.rep.cola)
+        if fila < n_prio:
+            return "prio", fila
+        if fila < n_cola:
+            return "cola", fila - n_prio
+        j = fila - n_cola
+        return ("prog", j) if j < len(self.proximos) else (None, None)
+
+    def actualizar_botones_cola(self):
+        tipo, i = self._tipo_sel()
+
+        def estado(boton, activo):
+            boton.state(["!disabled"] if activo else ["disabled"])
+        n = len(self.rep.cola)
+        estado(self.btn_sube, tipo == "cola" and i > 0)
+        estado(self.btn_baja, tipo == "cola" and i < n - 1)
+        estado(self.btn_ahora, tipo in ("cola", "prog"))
+        estado(self.btn_quitar, tipo in ("prio", "cola", "prog"))
+        self.btn_quitar.config(text="Saltar" if tipo == "prog" else "Quitar")
+        self.lbl_ayuda_cola.config(text={
+            None: "Elige un audio de la lista.",
+            "cola": "Ya le tocaba sonar. ▲ ▼ o arrastrar cambian el orden; «Ahora» lo pone ya.",
+            "prio": "Prioridad en espera de turno: puedes quitarla de la cola.",
+            "prog": "Programado: «Ahora» lo reproduce ya y salta su hora; «Saltar esta vez» "
+                    "solo lo omite esa vez."}[tipo])
 
     def mover_sel(self, d):
-        fila = self._sel_cola()
-        i = self._idx_cola(fila) if fila is not None else None
-        if i is None:
+        tipo, i = self._tipo_sel()
+        if tipo != "cola" or not 0 <= i + d < len(self.rep.cola):
             return
         self.rep.mover_cola(i, i + d)
-        self._redibujar_cola(fila + d if 0 <= i + d < len(self.rep.cola) else fila)
+        self._redibujar_cola(len(self.rep.cola_prio) + i + d)
 
     def quitar_sel(self):
-        fila = self._sel_cola()
-        i = self._idx_cola(fila) if fila is not None else None
-        if i is not None:
+        tipo, i = self._tipo_sel()
+        if tipo == "cola":
             self.rep.quitar_de_cola(i)
-            self._redibujar_cola()
+        elif tipo == "prio":
+            self.rep.cola_prio.pop(i)
+        elif tipo == "prog":
+            t, a = self.proximos[i]
+            self.omitir(a["id"], t)
+            self.log("Se omitió una vez '%s' de las %s." % (a["nombre"], fmt_hora(t.strftime("%H:%M"))))
+        else:
+            return
+        self._redibujar_cola()
+
+    def ahora_sel(self):
+        tipo, i = self._tipo_sel()
+        if tipo == "cola":
+            self.rep.adelantar(i)
+        elif tipo == "prog":
+            t, a = self.proximos[i]
+            self.omitir(a["id"], t)               # ya suena: no vuelve a sonar a su hora
+            self.rep.agregar(a)
+            self.log("Adelantado: %s (estaba para las %s)." % (a["nombre"], fmt_hora(t.strftime("%H:%M"))))
+        else:
+            return
+        self._redibujar_cola()
+
+    def omitir(self, aid, t):
+        """No lanzar el audio 'aid' en el minuto 't' (solo esa vez)."""
+        self.omitidas.add((aid, t.strftime("%Y-%m-%d %H:%M")))
+        self._guardar_omitidas()
+        self.calcular_proximo()
+
+    def _guardar_omitidas(self):
+        ayer = (dt.datetime.now() - dt.timedelta(days=1)).strftime("%Y-%m-%d %H:%M")
+        self.omitidas = {o for o in self.omitidas if o[1] >= ayer}
+        self.set_cfg_lista("omitidas", sorted([a, b] for a, b in self.omitidas))
+
+    # --- la app que se sigue en la pantalla principal ---
+    def seguir_app(self, clave):
+        """Muestra (o deja de mostrar) una app de la pestaña Apps en la pantalla principal."""
+        clave = clave or ""
+        if clave == self.app_clave and (clave == "") == (not self.fr_app.winfo_ismapped()):
+            return
+        self.app_clave = clave
+        self.db.set_cfg("app_seguir", clave)
+        self.app_meter = self.app_vol = None
+        self.app_pid = None
+        self.app_t_lento = 0.0
+        self.app_tit_prev = None
+        if clave:
+            self.fr_app.pack(fill="x", before=self.fr_abajo, pady=(0, 6))
+            self.lbl_app_nombre.config(text=clave.rsplit(".", 1)[0])
+            self.lbl_app_icono.config(image="")
+        else:
+            self.fr_app.pack_forget()
+
+    def _buscar_sesion_app(self):
+        """Cada segundo: localiza la sesión de audio de la app, su título y su canción."""
+        clave = self.app_clave
+        mejor, mejor_pico = None, -1.0
+        if AudioUtilities is not None and IAudioMeterInformation is not None:
+            try:
+                for s in AudioUtilities.GetAllSessions():
+                    try:
+                        if (s.Process is None or s.ProcessId == os.getpid()
+                                or s.Process.name().lower() != clave):
+                            continue
+                        m = s._ctl.QueryInterface(IAudioMeterInformation)
+                        pico = m.GetPeakValue()
+                        if mejor is None or pico > mejor_pico:
+                            mejor, mejor_pico = (s, m), pico
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        ruta = None
+        if mejor:
+            s, m = mejor
+            self.app_meter, self.app_vol, self.app_pid = m, s.SimpleAudioVolume, s.ProcessId
+            try:
+                ruta = s.Process.exe()
+            except Exception:
+                ruta = None
+        else:
+            self.app_meter = self.app_vol = self.app_pid = None
+        if not ruta:
+            for r in self.cfg_lista("apps_manuales"):
+                if os.path.basename(r).lower() == clave:
+                    ruta = r
+        nombre = (descripcion_exe(ruta) if ruta else None) or clave.rsplit(".", 1)[0]
+        self.lbl_app_nombre.config(text=nombre)
+        if ruta:
+            if ruta not in self.iconos_apps:
+                self.iconos_apps[ruta] = icono_exe(ruta, 16)
+            img = self.iconos_apps.get(ruta)
+            if img:
+                self.lbl_app_icono.config(image=img)
+        # canción: Windows 10/11 la entrega con su duración; si no, se limpia el título de la ventana
+        base = clave.rsplit(".", 1)[0]
+        smtc = None
+        if self.lector is not None:
+            cand = [d for d in self.lector.datos if base in d["app"].lower()]
+            if cand:
+                smtc = max(cand, key=lambda d: d["suena"])
+        self.app_smtc = smtc
+        if smtc and smtc["titulo"]:
+            titulo, artista = smtc["titulo"], smtc["artista"]
+        else:
+            titulo = limpiar_titulo(titulo_ventana(self.app_pid) if self.app_pid else "", [nombre])
+            artista = ""
+        if titulo != self.app_tit_prev:          # canción nueva: el cronómetro vuelve a cero
+            self.app_tit_prev, self.app_t0 = titulo, time.time()
+        self.app_titulo, self.app_artista = titulo, artista
+
+    def animar_app(self, ahora, dt_):
+        if not self.app_clave:
+            return
+        if ahora - self.app_t_lento > 1.0:
+            self.app_t_lento = ahora
+            self._buscar_sesion_app()
+        pre, vol = VU_MIN, 1.0
+        if self.app_meter is not None:
+            try:
+                p = self.app_meter.GetPeakValue()
+                pre = 20.0 * math.log10(p) if p > 1e-5 else VU_MIN
+                vol = self.app_vol.GetMasterVolume()
+            except Exception:
+                self.app_meter = self.app_vol = None
+        out = pre + (20.0 * math.log10(vol) if vol > 0.001 else -99.0)   # el medidor de Windows lee antes del volumen
+        # línea de tope: cuánto bajó su volumen respecto al original (se ve el damper funcionando)
+        orig = next((o for p, n, _, o in self.rep.sesiones if p == self.app_pid), None)
+        if orig is None:                      # (otra sesión del mismo programa)
+            orig = next((o for _, n, _, o in self.rep.sesiones
+                         if n.lower() == self.app_clave and o > 0.001), None)
+        tope, color, nota = 0.0, "#ffffff", "Volumen %d %%" % round(vol * 100)
+        if orig and self.rep.duck_o > 0 and orig > 0.001:
+            tope = 20.0 * math.log10(max(vol, 1e-4) / orig)
+            if tope < -0.5:
+                color, nota = "#ff9f43", "ATENUADA a %d %% de su volumen (suena un audio de Audiomático)" % round(
+                    vol / orig * 100)
+        elif self.app_clave in set(self.cfg_lista("apps_excluir")):
+            nota += "  ·  no se atenúa (marcada «No»)"
+        self.vu_app.actualizar(max(out, VU_MIN), max(pre, VU_MIN), dt_, ahora, tope, color)
+        if nota != self.lbl_app_nota.cget("text"):
+            self.lbl_app_nota.config(text=nota, foreground="#d35400" if color != "#ffffff" else "#666666")
+        # estado, canción y línea de reproducción
+        smtc = self.app_smtc if self.app_meter is not None or self.app_smtc else None
+        suena = self.app_meter is not None and pre > VU_MIN + 6
+        estado = ("Sin audio", "#888888") if self.app_meter is None else (
+            ("Sonando", "#1e8449") if suena else ("En silencio", "#888888"))
+        if smtc and not smtc["suena"] and self.app_meter is not None and not suena:
+            estado = ("En pausa", "#b9770e")
+        if estado[0] != self.lbl_app_estado.cget("text"):
+            self.lbl_app_estado.config(text=estado[0], foreground=estado[1])
+        cancion = self.app_titulo or ("(sin título)" if self.app_meter is not None else "")
+        if len(cancion) > 46:
+            cancion = cancion[:45] + "…"
+        if self.app_artista:
+            cancion = ("%s — %s" % (cancion, self.app_artista))[:60]
+        if cancion != self.lbl_app_cancion.cget("text"):
+            self.lbl_app_cancion.config(text=cancion)
+        if smtc and smtc["dur"] > 0:
+            pos = smtc["pos"] + ((ahora - smtc["t"]) if smtc["suena"] else 0.0)
+            pos = min(pos, smtc["dur"])
+            frac, txt = pos / smtc["dur"], "%s / %s" % (self._mmss(pos), self._mmss(smtc["dur"]))
+        elif self.app_titulo:
+            frac, txt = 0.0, self._mmss(ahora - self.app_t0)      # sin duración: tiempo transcurrido
+        else:
+            frac, txt = 0.0, ""
+        if txt != self.lbl_app_tiempo.cget("text"):
+            self.lbl_app_tiempo.config(text=txt)
+        self.dibujar_progreso(frac, "#d35400" if color != "#ffffff" else "#1e64c8", self.cv_app_prog)
 
     # --- próximo audio programado ---
     @staticmethod
@@ -2764,7 +3162,9 @@ class App:
         etiqueta de arriba. Mira hasta 4 días adelante y guarda hasta 15 emisiones."""
         base = dt.datetime.now().replace(second=0, microsecond=0)
         activos = self.db.q("SELECT * FROM audios WHERE activo=1")
-        self.proximos = proximas_emisiones(activos, base, 4 * 24 * 60, 15)
+        self.proximos = [
+            (t, a) for t, a in proximas_emisiones(activos, base, 4 * 24 * 60, 15 + len(self.omitidas))
+            if (a["id"], t.strftime("%Y-%m-%d %H:%M")) not in self.omitidas][:15]
         if not self.proximos:
             self.lbl_proximo.config(text="" if not activos else
                                     "Próximo: nada en los próximos 4 días")
@@ -3730,7 +4130,7 @@ class App:
             self.calcular_proximo()
             toca = [] if self.manual else [      # en modo manual no suena nada programado
                 a for a in self.db.q("SELECT * FROM audios WHERE activo=1")
-                if le_toca(a, ahora)]
+                if le_toca(a, ahora) and (a["id"], clave) not in self.omitidas]   # y no los saltados
             toca.sort(key=lambda a: -a["prioridad"])  # primero los de prioridad
             for a in toca:
                 self.rep.agregar(a)
@@ -3748,8 +4148,9 @@ def diagnostico(rutas):
            "pygame %s (SDL %s, SDL_mixer %s)" % (
                pygame.version.ver, ".".join(map(str, pygame.version.SDL)),
                ".".join(map(str, pygame.mixer.get_sdl_mixer_version()))),
-           "miniaudio: %s | psutil: %s | pycaw: %s" % (
-               "sí" if miniaudio else "NO", "sí" if psutil else "NO", "sí" if AudioUtilities else "NO")]
+           "miniaudio: %s | psutil: %s | pycaw: %s | controles multimedia de Windows 10/11: %s" % (
+               "sí" if miniaudio else "NO", "sí" if psutil else "NO", "sí" if AudioUtilities else "NO",
+               "sí" if _GSMTC else "no disponibles (Windows 7 o sin winsdk)")]
     try:
         try:
             pygame.mixer.init(44100, -16, 2, 2048, allowedchanges=0)
