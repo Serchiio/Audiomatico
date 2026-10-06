@@ -1,7 +1,7 @@
 ﻿; Instalador de Audiomático (Inno Setup 6). Se compila con compilar.bat.
 ; Incluye el .exe de 64 bits si existe; si no, instala el de 32 bits (corre en ambos).
 #define Nombre "Audiomático"
-#define Version "1.4.0"
+#define Version "1.4.1"
 #define Exe "Audiomatico.exe"
 
 [Setup]

@@ -51,7 +51,7 @@ except Exception:
 
 APP = "ProgramadorAudios"   # nombre interno: carpeta de datos, registro y tarea (no cambiar)
 NOMBRE = "Audiomático"      # nombre que ve el usuario
-VERSION = "1.4.0"           # igual que en instalador.iss
+VERSION = "1.4.1"           # igual que en instalador.iss
 # colores de categoría (se asignan solos, rotando) y fuente exclusiva de la prioridad
 PALETA = ["#d9534f", "#f0ad4e", "#5cb85c", "#3ea6c4", "#6f7bd9", "#a463c9", "#e0679a",
           "#8d6e63"]
@@ -1901,11 +1901,43 @@ try:
     from pycaw.pycaw import IAudioMeterInformation
 except Exception:
     IAudioMeterInformation = None
-try:      # controles multimedia de Windows 10/11 (no existen en Windows 7: queda en None)
-    from winsdk.windows.media.control import (
-        GlobalSystemMediaTransportControlsSessionManager as _GSMTC)
-except Exception:
-    _GSMTC = None
+def version_windows():
+    """(mayor, menor, compilación) REAL de Windows (RtlGetVersion no depende del manifiesto)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class OSV(ctypes.Structure):
+            _fields_ = [("size", wintypes.DWORD), ("major", wintypes.DWORD), ("minor", wintypes.DWORD),
+                        ("build", wintypes.DWORD), ("platform", wintypes.DWORD),
+                        ("csd", wintypes.WCHAR * 128)]
+        v = OSV()
+        v.size = ctypes.sizeof(OSV)
+        ctypes.windll.ntdll.RtlGetVersion(ctypes.byref(v))
+        return v.major, v.minor, v.build
+    except Exception:
+        g = sys.getwindowsversion()
+        return g.major, g.minor, g.build
+
+
+_GSMTC = None          # controles multimedia de Windows 10/11 (None = aún no cargados)
+_GSMTC_PROBADO = False
+
+
+def cargar_gsmtc():
+    """Carga 'winsdk' SOLO en Windows 10 o más nuevo. En Windows 7 ese módulo busca APIs de
+    WinRT (combase.dll) que no existen y cierra el programa de golpe, así que ni se importa."""
+    global _GSMTC, _GSMTC_PROBADO
+    if not _GSMTC_PROBADO:
+        _GSMTC_PROBADO = True
+        if version_windows()[0] >= 10:
+            try:
+                from winsdk.windows.media.control import (
+                    GlobalSystemMediaTransportControlsSessionManager as _M)
+                _GSMTC = _M
+            except Exception:
+                _GSMTC = None
+    return _GSMTC
 
 _NOMBRES_SERVICIOS = {
     "youtube music", "youtube", "spotify", "soundcloud", "deezer", "tidal", "apple music",
@@ -2171,7 +2203,7 @@ class App:
         # (por ejemplo al actualizarse) no vuelve a lanzar los audios de ese minuto
         self.ultimo_minuto = self.db.cfg("ultimo_minuto", "") or None
         self.omitidas = {(int(a), b) for a, b in self.cfg_lista("omitidas")}
-        if _GSMTC is not None:              # Windows 10/11: título, posición y duración de otras apps
+        if cargar_gsmtc():                  # solo Windows 10/11: título, posición y duración de otras apps
             self.lector = LectorMedios()
             self.lector.start()
         self.seguir_app(self.db.cfg("app_seguir", ""))
@@ -2195,7 +2227,9 @@ class App:
         threading.Thread(target=self.escuchar, args=(sock,), daemon=True).start()
         if minimizado:
             self.ocultar()
-        self.log("Programa iniciado.")
+        self.log("Programa iniciado (%s %s, Windows %d.%d.%d, Python %s %s)." % (
+            NOMBRE, VERSION, *version_windows(), sys.version.split()[0],
+            "64 bits" if sys.maxsize > 2 ** 32 else "32 bits"))
         self.tick()
 
     # ---------------- interfaz ----------------
@@ -4150,7 +4184,7 @@ def diagnostico(rutas):
                ".".join(map(str, pygame.mixer.get_sdl_mixer_version()))),
            "miniaudio: %s | psutil: %s | pycaw: %s | controles multimedia de Windows 10/11: %s" % (
                "sí" if miniaudio else "NO", "sí" if psutil else "NO", "sí" if AudioUtilities else "NO",
-               "sí" if _GSMTC else "no disponibles (Windows 7 o sin winsdk)")]
+               "sí" if cargar_gsmtc() else "no disponibles (Windows %d.%d: se necesita Windows 10 o más nuevo)" % version_windows()[:2])]
     try:
         try:
             pygame.mixer.init(44100, -16, 2, 2048, allowedchanges=0)
@@ -4200,6 +4234,39 @@ def diagnostico(rutas):
         pass
 
 
+_FALLOS = None
+
+
+def activar_registro_de_fallos():
+    """Si el programa se cierra de golpe (error del sistema, módulo que falla) o lanza un error no
+    controlado, queda escrito en fallos.txt (carpeta de datos) qué pasó y dónde. Sin esto, en un
+    .exe sin consola un cierre brusco no dejaría ninguna pista."""
+    global _FALLOS
+    try:
+        os.makedirs(CARPETA, exist_ok=True)
+        ruta = os.path.join(CARPETA, "fallos.txt")
+        if os.path.exists(ruta) and os.path.getsize(ruta) > 256 * 1024:
+            os.replace(ruta, ruta + ".1")
+        _FALLOS = open(ruta, "a", encoding="utf-8", buffering=1)
+        _FALLOS.write("\n=== %s  %s %s  Windows %d.%d.%d  Python %s %s ===\n" % (
+            time.strftime("%Y-%m-%d %H:%M:%S"), NOMBRE, VERSION, *version_windows(),
+            sys.version.split()[0], "64 bits" if sys.maxsize > 2 ** 32 else "32 bits"))
+        import faulthandler
+        faulthandler.enable(file=_FALLOS, all_threads=True)       # cierres bruscos (violación de acceso...)
+
+        def excepcion(tipo, valor, tb):
+            import traceback
+            _FALLOS.write("Error no controlado:\n" + "".join(traceback.format_exception(tipo, valor, tb)))
+            try:
+                messagebox.showerror(NOMBRE, "El programa tuvo un error y se cerrará.\n\nSe guardó el "
+                                     "detalle en:\n%s" % ruta)
+            except Exception:
+                pass
+        sys.excepthook = excepcion
+    except Exception:
+        _FALLOS = None
+
+
 def main():
     global PUERTO
     if "--diagnostico" in sys.argv:
@@ -4211,6 +4278,7 @@ def main():
     sock = instancia_unica(not minimizado)
     if sock is None:
         return  # ya hay una copia abierta
+    activar_registro_de_fallos()
     app = App(minimizado, sock)
     app.root.mainloop()
 
