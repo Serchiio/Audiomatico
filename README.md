@@ -54,9 +54,14 @@ py -3.8 -m venv .venv
 
 ## Compilar e instalador
 
-`compilar.bat` genera `dist\32bits\Audiomatico.exe` y `dist\64bits\Audiomatico.exe` con PyInstaller, y el instalador con [Inno Setup](https://jrsoftware.org/isinfo.php) (`instalador.iss`). Hace falta Python 3.8 de 32 y de 64 bits. Si falta alguno, lo omite.
+`compilar.bat` genera dos variantes de 32 bits con PyInstaller, cada una en su propio entorno virtual: `dist\win7\Audiomatico.exe` (sin `winsdk`, para Windows 7 en adelante) y `dist\win10\Audiomatico.exe` (con `winsdk`, `requirements-win10.txt`). Los instaladores se crean con [Inno Setup](https://jrsoftware.org/isinfo.php) (`instalador.iss`). Hace falta Python 3.8 de 32 bits.
 
-Nota para Windows 7: necesita el Service Pack 1 y la actualización KB2999226 (Universal C Runtime).
+## Requisitos en Windows 7
+
+Necesita el **Service Pack 1** y estas actualizaciones de Windows (Python 3.8 las exige; un Windows 7 al día ya las tiene):
+
+- **KB3118401** (o su antecesora KB2999226): Universal C Runtime. Sin ella: «falta api-ms-win-crt-runtime-l1-1-0.dll».
+- **KB3063858** (o su antecesora KB2533623): carga segura de DLL. Sin ella: «DLL load failed … El parámetro no es correcto».
 
 ## Publicar una versión nueva
 
