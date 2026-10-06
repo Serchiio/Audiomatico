@@ -1,8 +1,12 @@
-﻿; Instalador de Audiomático (Inno Setup 6). Se compila con compilar.bat.
-; Incluye el .exe de 64 bits si existe; si no, instala el de 32 bits (corre en ambos).
+﻿; Instalador de Audiomático (Inno Setup). Se compila con compilar.bat, que genera las dos variantes.
 #define Nombre "Audiomático"
-#define Version "1.4.1"
+#define Version "1.4.2"
 #define Exe "Audiomatico.exe"
+; Variante: /DVariante=win7  -> 32 bits, SIN winsdk. Sirve en todo Windows (7, 8, 10, 11).
+;           /DVariante=win10 -> con winsdk (artista y duración de otras apps). Solo Windows 10/11.
+#ifndef Variante
+  #define Variante "win7"
+#endif
 
 [Setup]
 AppId={{92177A21-DFD8-4980-9293-37B8AE61C4EE}
@@ -16,15 +20,17 @@ UninstallDisplayName={#Nombre}
 SetupIconFile=icono.ico
 LicenseFile=LICENCIA_USO.txt
 OutputDir=instalador
+#if Variante == "win10"
+OutputBaseFilename=Audiomatico_Win10-11_{#Version}
+MinVersion=10.0
+#else
 OutputBaseFilename=Instalar_Audiomatico_{#Version}
+#endif
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
 CloseApplications=yes
-#ifexist "dist\64bits\Audiomatico.exe"
-ArchitecturesInstallIn64BitMode=x64
-#endif
 
 [Languages]
 Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
@@ -33,12 +39,7 @@ Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 Name: "escritorio"; Description: "Crear un acceso directo en el escritorio"; GroupDescription: "Accesos directos:"
 
 [Files]
-#ifexist "dist\64bits\Audiomatico.exe"
-Source: "dist\64bits\{#Exe}"; DestDir: "{app}"; Flags: ignoreversion; Check: Is64BitInstallMode
-Source: "dist\32bits\{#Exe}"; DestDir: "{app}"; Flags: ignoreversion; Check: not Is64BitInstallMode
-#else
-Source: "dist\32bits\{#Exe}"; DestDir: "{app}"; Flags: ignoreversion
-#endif
+Source: "dist\{#Variante}\{#Exe}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#Nombre}"; Filename: "{app}\{#Exe}"

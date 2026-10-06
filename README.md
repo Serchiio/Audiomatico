@@ -35,7 +35,12 @@ Programador de audios para Windows. Reproduce tus audios (MP3, WAV, OGG, FLAC) a
 
 ## Instalación (usuarios)
 
-Descarga `Instalar_Audiomatico_x.y.z.exe` desde la sección **Releases** y ejecútalo. Tus datos quedan en `%APPDATA%\ProgramadorAudios` y no se borran al desinstalar. Las versiones siguientes se pueden instalar desde el propio programa (Sistema → Buscar actualizaciones).
+Descarga desde la sección **Releases** el instalador que corresponda y ejecútalo:
+
+- **Windows 7 / 8** (o si dudas): `Instalar_Audiomatico_x.y.z.exe`. Sirve en cualquier Windows.
+- **Windows 10 / 11**: `Audiomatico_Win10-11_x.y.z.exe`. Igual, pero además muestra el artista y la duración exacta de la canción de otras apps.
+
+El programa elige solo el instalador correcto al actualizarse. Tus datos quedan en `%APPDATA%\ProgramadorAudios` y no se borran al desinstalar. Las versiones siguientes se pueden instalar desde el propio programa (Sistema → Buscar actualizaciones).
 
 ## Ejecutar desde el código
 
@@ -57,9 +62,9 @@ Nota para Windows 7: necesita el Service Pack 1 y la actualización KB2999226 (U
 
 1. Sube el número en `VERSION` (`programador_audios.py`) y en `#define Version` (`instalador.iss`).
 2. Ejecuta `compilar.bat`.
-3. En GitHub crea una *Release* con el tag `vX.Y.Z` y adjunta `instalador\Instalar_Audiomatico_X.Y.Z.exe`.
+3. En GitHub crea una *Release* con el tag `vX.Y.Z` y adjunta los dos instaladores: `Instalar_Audiomatico_X.Y.Z.exe` y `Audiomatico_Win10-11_X.Y.Z.exe`. Publícala primero como *prerelease* y promuévela cuando se confirme que abre en Windows 7.
 
-El programa instalado detecta la release, descarga el archivo cuyo nombre empieza por `Instalar_Audiomatico` y comprueba el SHA-256 que GitHub calcula para cada archivo adjunto antes de ejecutarlo.
+El programa instalado detecta la release, descarga `Audiomatico_Win10-11_*` en Windows 10/11 o `Instalar_Audiomatico_*` en cualquier otro y comprueba el SHA-256 que GitHub calcula para cada archivo adjunto antes de ejecutarlo.
 
 ## Licencia
 

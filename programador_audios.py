@@ -51,7 +51,7 @@ except Exception:
 
 APP = "ProgramadorAudios"   # nombre interno: carpeta de datos, registro y tarea (no cambiar)
 NOMBRE = "Audiomático"      # nombre que ve el usuario
-VERSION = "1.4.1"           # igual que en instalador.iss
+VERSION = "1.4.2"          # igual que en instalador.iss
 # colores de categoría (se asignan solos, rotando) y fuente exclusiva de la prioridad
 PALETA = ["#d9534f", "#f0ad4e", "#5cb85c", "#3ea6c4", "#6f7bd9", "#a463c9", "#e0679a",
           "#8d6e63"]
@@ -200,9 +200,15 @@ def buscar_actualizacion(version_actual=None):
                 notas=(datos.get("body") or "").strip(), pagina=datos.get("html_url", ""))
     prefijo = "https://github.com/%s/releases/download/" % REPO
     assets = datos.get("assets", [])
-    for a in assets:
-        if re.match(r"(?i)^instalar_audiomatico.*\.exe$", a["name"]) \
-                and a["browser_download_url"].startswith(prefijo):
+    # dos instaladores: «Instalar_Audiomatico_x.exe» (Windows 7/8, 32 bits, sin módulos nuevos; sirve
+    # en cualquier Windows) y «Audiomatico_Win10-11_x.exe» (con duración/artista de otras apps).
+    # Windows 10/11 prefiere el segundo; los demás SOLO reciben el primero.
+    patrones = [r"(?i)^instalar_audiomatico.*\.exe$"]
+    if version_windows()[0] >= 10:
+        patrones.insert(0, r"(?i)^audiomatico_win10-11.*\.exe$")
+    elegido = [a for pat in patrones for a in assets if re.match(pat, a["name"])]
+    for a in elegido[:1]:
+        if a["browser_download_url"].startswith(prefijo):
             info["instalador"] = a["browser_download_url"]
             sha = (a.get("digest") or "")
             if sha.startswith("sha256:"):
@@ -2230,6 +2236,8 @@ class App:
         self.log("Programa iniciado (%s %s, Windows %d.%d.%d, Python %s %s)." % (
             NOMBRE, VERSION, *version_windows(), sys.version.split()[0],
             "64 bits" if sys.maxsize > 2 ** 32 else "32 bits"))
+        self.log("Canción/duración de otras apps: %s." % (
+            "disponible (Windows 10/11)" if self.lector else "no disponible (solo título y tiempo)"))
         self.tick()
 
     # ---------------- interfaz ----------------

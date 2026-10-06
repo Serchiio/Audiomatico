@@ -1,21 +1,21 @@
 @echo off
 REM ============================================================
-REM  Compila Audiomatico para Windows 7 / 8 / 10 / 11 y crea el instalador.
-REM  Genera:
-REM     dist\32bits\Audiomatico.exe   (sirve en Windows de 32 y 64 bits)
-REM     dist\64bits\Audiomatico.exe   (solo Windows de 64 bits)
-REM     instalador\Instalar_Audiomatico_x.y.z.exe   (con Inno Setup 6)
-REM  Requisitos: Python 3.8 de 32 y de 64 bits (python.org, 3.8.10) e
-REM  Inno Setup 6 (jrsoftware.org). Usa el lanzador "py".
+REM  Compila Audiomatico en DOS variantes y crea sus instaladores.
+REM    win7   -> dist\win7\Audiomatico.exe    32 bits, SIN winsdk. Sirve en Windows 7/8/10/11.
+REM              instalador\Instalar_Audiomatico_x.y.z.exe
+REM    win10  -> dist\win10\Audiomatico.exe   32 bits, CON winsdk (artista y duracion de otras apps).
+REM              instalador\Audiomatico_Win10-11_x.y.z.exe   (solo Windows 10/11)
+REM  Requisitos: Python 3.8 de 32 bits (python.org, 3.8.10) e Inno Setup 6/7.
 REM  Uso:  compilar.bat            (al final espera una tecla)
 REM        compilar.bat nopause    (sin pausa)
 REM ============================================================
 setlocal
 cd /d "%~dp0"
 
-call :compilar 32 "py -3.8-32"
-call :compilar 64 "py -3.8-64"
-call :instalador
+call :compilar win7 requirements.txt
+call :compilar win10 requirements.txt requirements-win10.txt
+call :instalador win7
+call :instalador win10
 
 echo.
 echo Listo. Revisa las carpetas dist\ e instalador\
@@ -23,29 +23,33 @@ if /i not "%~1"=="nopause" pause
 exit /b 0
 
 :compilar
-set ARQ=%~1
-set PY=%~2
+set VAR=%~1
+set REQ=-r %~2
+if not "%~3"=="" set REQ=%REQ% -r %~3
+set EXCL=
+if "%VAR%"=="win7" set EXCL=--exclude-module winsdk
 echo.
-echo ===== Compilando %ARQ% bits =====
-%PY% --version >nul 2>&1
+echo ===== Compilando variante %VAR% (32 bits) =====
+py -3.8-32 --version >nul 2>&1
 if errorlevel 1 (
-    echo No se encontro Python 3.8 de %ARQ% bits. Se omite.
+    echo No se encontro Python 3.8 de 32 bits. Se omite.
     exit /b 0
 )
-if not exist ".venv%ARQ%\Scripts\python.exe" %PY% -m venv ".venv%ARQ%"
-".venv%ARQ%\Scripts\python.exe" -m pip install --upgrade pip
-".venv%ARQ%\Scripts\python.exe" -m pip install -r requirements.txt -r requirements-build.txt
-".venv%ARQ%\Scripts\python.exe" icono.py
-".venv%ARQ%\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --noconsole ^
+REM un entorno aparte por variante: el de win7 NUNCA debe tener winsdk instalado
+if not exist ".venv_%VAR%\Scripts\python.exe" py -3.8-32 -m venv ".venv_%VAR%"
+".venv_%VAR%\Scripts\python.exe" -m pip install --upgrade pip
+".venv_%VAR%\Scripts\python.exe" -m pip install %REQ% -r requirements-build.txt
+".venv_%VAR%\Scripts\python.exe" icono.py
+".venv_%VAR%\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --noconsole %EXCL% ^
     --name Audiomatico --icon "%~dp0icono.ico" --add-data "%~dp0icono.ico;." ^
-    --distpath "dist\%ARQ%bits" --workpath "build\%ARQ%" --specpath "build" ^
+    --distpath "dist\%VAR%" --workpath "build\%VAR%" --specpath "build" ^
     --hidden-import comtypes.stream --hidden-import _cffi_backend --hidden-import _miniaudio ^
     programador_audios.py
 exit /b 0
 
 :instalador
 echo.
-echo ===== Creando el instalador =====
+echo ===== Creando el instalador %~1 =====
 set ISCC=
 REM 1) donde lo registro el instalador de Inno Setup (versiones 7 y 6, vistas de 32 y 64 bits)
 for %%V in (7 6) do for %%R in (32 64) do (
@@ -61,6 +65,10 @@ if "%ISCC%"=="" (
     echo No se encontro Inno Setup. Se omite el instalador.
     exit /b 0
 )
+if not exist "dist\%~1\Audiomatico.exe" (
+    echo Falta dist\%~1\Audiomatico.exe. Se omite este instalador.
+    exit /b 0
+)
 echo Usando: %ISCC%
-"%ISCC%" instalador.iss
+"%ISCC%" /DVariante=%~1 instalador.iss
 exit /b 0
