@@ -51,7 +51,7 @@ except Exception:
 
 APP = "ProgramadorAudios"   # nombre interno: carpeta de datos, registro y tarea (no cambiar)
 NOMBRE = "Audiomático"      # nombre que ve el usuario
-VERSION = "1.4.2"          # igual que en instalador.iss
+VERSION = "1.4.3"          # igual que en instalador.iss
 # colores de categoría (se asignan solos, rotando) y fuente exclusiva de la prioridad
 PALETA = ["#d9534f", "#f0ad4e", "#5cb85c", "#3ea6c4", "#6f7bd9", "#a463c9", "#e0679a",
           "#8d6e63"]
@@ -754,20 +754,64 @@ def poner_autoinicio(activar):
                 pass
 
 
-def tarea_programada(hhmm):
+def partes_inicio():
+    """(programa, argumentos) que abren este programa en segundo plano."""
+    if getattr(sys, "frozen", False):
+        return sys.executable, "--minimizado"
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.exists(pyw):
+        pyw = sys.executable
+    return pyw, '"%s" --minimizado' % os.path.abspath(sys.argv[0])
+
+
+def xml_tarea(hhmm, programa, argumentos, hoy=None):
+    """Definición de la tarea diaria. Con «schtasks /Create /SC DAILY» Windows la deja con
+    «no iniciar con batería» y «detener a las 72 h» (mataría el programa); aquí no."""
+    from xml.sax.saxutils import escape
+    h, m = parse_hora(hhmm)
+    hoy = hoy or dt.date.today()
+    inicio = "%04d-%02d-%02dT%02d:%02d:00" % (hoy.year, hoy.month, hoy.day, h, m)
+    return ('<?xml version="1.0" encoding="UTF-16"?>\n'
+            '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+            '  <Triggers><CalendarTrigger><StartBoundary>%s</StartBoundary><Enabled>true</Enabled>\n'
+            '    <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger></Triggers>\n'
+            '  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType>'
+            '<RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n'
+            '  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
+            '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
+            '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
+            '<StartWhenAvailable>true</StartWhenAvailable>'
+            '<AllowHardTerminate>true</AllowHardTerminate><Enabled>true</Enabled>'
+            '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>\n'
+            '  <Actions Context="Author"><Exec><Command>%s</Command><Arguments>%s</Arguments></Exec></Actions>\n'
+            '</Task>\n' % (inicio, escape(programa), escape(argumentos)))
+
+
+def tarea_programada(hhmm, nombre=None):
     """Crea (o borra si hhmm es None) la tarea diaria que abre el programa."""
+    nombre = nombre or APP
     flags = 0x08000000  # CREATE_NO_WINDOW
-    if hhmm is None:
-        cmd = ["schtasks", "/Delete", "/TN", APP, "/F"]
-    else:
-        cmd = ["schtasks", "/Create", "/SC", "DAILY", "/TN", APP,
-               "/TR", comando_inicio(), "/ST", hhmm, "/F"]
+    ruta = None
     try:
+        if hhmm is None:
+            cmd = ["schtasks", "/Delete", "/TN", nombre, "/F"]
+        else:
+            programa, argumentos = partes_inicio()
+            fd, ruta = tempfile.mkstemp(suffix=".xml")
+            with os.fdopen(fd, "w", encoding="utf-16") as f:
+                f.write(xml_tarea(hhmm, programa, argumentos))
+            cmd = ["schtasks", "/Create", "/TN", nombre, "/XML", ruta, "/F"]
         r = subprocess.run(cmd, capture_output=True, text=True,
                            errors="replace", creationflags=flags)
         return r.returncode == 0, (r.stdout + r.stderr).strip()
     except Exception as e:
         return False, str(e)
+    finally:
+        if ruta:
+            try:
+                os.remove(ruta)
+            except OSError:
+                pass
 
 
 def instancia_unica(mostrar):
@@ -2209,6 +2253,16 @@ class App:
         # (por ejemplo al actualizarse) no vuelve a lanzar los audios de ese minuto
         self.ultimo_minuto = self.db.cfg("ultimo_minuto", "") or None
         self.omitidas = {(int(a), b) for a, b in self.cfg_lista("omitidas")}
+        # las tareas creadas por versiones anteriores quedaron con «no iniciar con batería» y
+        # «detener a las 72 h»: se vuelven a crear una vez con la definición corregida
+        apertura = self.db.cfg("apertura", "")
+        if apertura and self.db.cfg("tarea_version", "") != VERSION:
+            ok, salida = tarea_programada(apertura)
+            if ok:
+                self.db.set_cfg("tarea_version", VERSION)
+            self.log("Apertura automática de las %s %s." % (
+                apertura, "actualizada (corre con batería y sin límite de horas)" if ok
+                else "NO se pudo actualizar: " + salida[:120]))
         if cargar_gsmtc():                  # solo Windows 10/11: título, posición y duración de otras apps
             self.lector = LectorMedios()
             self.lector.start()
@@ -2233,7 +2287,8 @@ class App:
         threading.Thread(target=self.escuchar, args=(sock,), daemon=True).start()
         if minimizado:
             self.ocultar()
-        self.log("Programa iniciado (%s %s, Windows %d.%d.%d, Python %s %s)." % (
+        self.log("Programa iniciado%s (%s %s, Windows %d.%d.%d, Python %s %s)." % (
+            " en segundo plano (inicio automático o tarea programada)" if minimizado else "",
             NOMBRE, VERSION, *version_windows(), sys.version.split()[0],
             "64 bits" if sys.maxsize > 2 ** 32 else "32 bits"))
         self.log("Canción/duración de otras apps: %s." % (
@@ -4065,6 +4120,7 @@ class App:
         ok, salida = tarea_programada(hhmm)
         if ok:
             self.db.set_cfg("apertura", hhmm)
+            self.db.set_cfg("tarea_version", VERSION)
             self.v_apertura.set(fmt_hora(hhmm))
             messagebox.showinfo("Listo", "El programa se abrirá todos los días a las %s."
                                 % fmt_hora(hhmm))
