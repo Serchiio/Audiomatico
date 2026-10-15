@@ -51,7 +51,7 @@ except Exception:
 
 APP = "ProgramadorAudios"   # nombre interno: carpeta de datos, registro y tarea (no cambiar)
 NOMBRE = "Audiomático"      # nombre que ve el usuario
-VERSION = "1.4.3"          # igual que en instalador.iss
+VERSION = "1.5.0"          # igual que en instalador.iss
 # colores de categoría (se asignan solos, rotando) y fuente exclusiva de la prioridad
 PALETA = ["#d9534f", "#f0ad4e", "#5cb85c", "#3ea6c4", "#6f7bd9", "#a463c9", "#e0679a",
           "#8d6e63"]
@@ -69,6 +69,7 @@ PUERTO = 47653  # para evitar abrir dos copias del programa
 DIAS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
 EXTENSIONES = (".mp3", ".wav", ".ogg", ".flac")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+TRAZA_VOL = None           # solo para pruebas: --traza-volumenes archivo.csv
 
 
 # ----------------------------------------------------------------------
@@ -879,6 +880,70 @@ class VolumenWindows:
             self.vol.SetMasterVolume(max(0.0, min(1.0, pct / 100.0)), None)
         except Exception:
             self.vol = None
+
+
+def volumen_maestro(nuevo=None):
+    """Volumen GENERAL de Windows (0..1). Si 'nuevo' no es None y difiere, lo cambia.
+    Devuelve el valor que tenía antes de cambiarlo, o None si no se pudo leer."""
+    if AudioUtilities is None:
+        return None
+    try:
+        from ctypes import cast, POINTER
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import IAudioEndpointVolume
+        disp = AudioUtilities.GetSpeakers()
+        iface = disp.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        vol = cast(iface, POINTER(IAudioEndpointVolume))
+        actual = vol.GetMasterVolumeLevelScalar()
+        if nuevo is not None and abs(actual - nuevo) > 0.005:
+            vol.SetMasterVolumeLevelScalar(max(0.0, min(1.0, nuevo)), None)
+        return actual
+    except Exception:
+        return None
+
+
+class Nivelador:
+    """Mantiene estable el nivel de SALIDA de una app moviendo su volumen en el Mezclador.
+    El medidor de Windows lee la señal ANTES del volumen de la app, así que
+    salida = entrada + volumen. Se recuerda el pico reciente de la entrada (sube al instante y
+    baja despacio) y el volumen se mueve hacia el que deja ese pico en el nivel objetivo:
+    rápido hacia abajo (una canción fuerte) y despacio hacia arriba (una canción baja).
+    No ve el futuro: una canción fuerte suena fuerte durante una fracción de segundo."""
+    BAJA_ENTRADA = 6.0      # dB/s que tarda en olvidarse un pico
+    SUBE_VOL = 3.0          # dB/s máximo al SUBIR el volumen
+    BAJA_VOL = 60.0         # dB/s máximo al BAJAR el volumen (una canción fuerte tras una baja)
+    SILENCIO = -55.0        # dB: por debajo no hay nada que medir (pausa, hueco entre canciones)
+
+    def __init__(self, objetivo_db=-18.0, vmin=0.03, vmax=1.0):
+        self.objetivo = objetivo_db
+        self.vmin = max(0.001, vmin)
+        self.vmax = max(self.vmin, min(1.0, vmax))
+        self.entrada = -99.0        # pico reciente de la entrada (dB)
+        self.mudo = 0.0             # segundos seguidos sin señal
+
+    @staticmethod
+    def _db(x):
+        return 20.0 * math.log10(x) if x > 1e-5 else -99.0
+
+    def paso(self, pico, v_actual, dt):
+        """pico: 0..1 leído antes del volumen. Devuelve el volumen (0..1) que debe tener ya."""
+        if v_actual > self.vmax:
+            return self.vmax                   # el máximo es un tope: no se negocia
+        nivel = self._db(pico)
+        if nivel < self.SILENCIO:              # pausa o hueco entre canciones: se congela todo
+            self.mudo += dt                    # (si no, al olvidar el pico el volumen se dispararía)
+            return max(self.vmin, v_actual)
+        self.mudo = 0.0
+        self.entrada = nivel if nivel > self.entrada else max(nivel, self.entrada - self.BAJA_ENTRADA * dt)
+        if self.entrada < self.SILENCIO:
+            return max(self.vmin, v_actual)    # nada que medir: se deja como está
+        v_db = self._db(max(v_actual, 1e-4))
+        deseado = min(max(self.objetivo - self.entrada, self._db(self.vmin)), self._db(self.vmax))
+        if deseado < v_db:
+            v_db = max(deseado, v_db - self.BAJA_VOL * dt)
+        else:
+            v_db = min(deseado, v_db + self.SUBE_VOL * dt)
+        return 10.0 ** (v_db / 20.0)
 
 
 # ----------------------------------------------------------------------
@@ -2206,6 +2271,14 @@ class App:
         self.app_tit_prev = None
         self.app_titulo = self.app_artista = ""
         self.app_t0 = time.time()
+        self.app_out_pico = -99.0           # pico reciente de la SALIDA de la app mostrada (dB)
+        # bloqueo de volúmenes y nivelador (pestaña Apps)
+        self._niveladores = {}              # pid -> Nivelador
+        self._volcfg = None
+        self._vol_t_cfg = 0.0
+        self._vol_t_prev = 0.0
+        self._vol_ses = []
+        self._vol_log_t = {}
         self._nivelando = False
         self.cola_nivelar = []
         global FORMATO_12H
@@ -2361,11 +2434,12 @@ class App:
             anchor="w", padx=10, pady=(10, 6))
         marco = ttk.Frame(f)
         marco.pack(fill="both", expand=True, padx=10)
-        cols = ("ventana", "vol", "estado", "atenuar")
-        self.tree_apps = ttk.Treeview(marco, columns=cols, selectmode="browse", height=12)
+        cols = ("ventana", "vol", "estado", "atenuar", "fijado")
+        self.tree_apps = ttk.Treeview(marco, columns=cols, selectmode="browse", height=7)
         self.tree_apps.heading("#0", text="App")
-        for c, t, w in (("ventana", "Lo que se ve en su ventana", 380), ("vol", "Volumen", 80),
-                        ("estado", "Estado", 110), ("atenuar", "¿Atenuar?", 80)):
+        for c, t, w in (("ventana", "Lo que se ve en su ventana", 300), ("vol", "Volumen", 70),
+                        ("estado", "Estado", 90), ("atenuar", "¿Atenuar?", 70),
+                        ("fijado", "Volumen fijado", 130)):
             self.tree_apps.heading(c, text=t)
             self.tree_apps.column(c, width=w, anchor="w" if c == "ventana" else "center")
         self.tree_apps.column("#0", width=260)
@@ -2397,7 +2471,279 @@ class App:
                           "sonando ahora), usa «Añadir app a mano» y elige su programa (.exe). "
                           "Doble clic = atenuar Sí / No.",
                   foreground="#888888", justify="left").pack(anchor="w", padx=10)
+        self._ui_volumenes(f)
         self.root.after(2000, self._ciclo_apps)
+        self.root.after(2500, self._ciclo_volumenes)
+
+    # ---------------- volúmenes fijos y nivelador ----------------
+    MODOS_VOL = ("Libre (no tocar)", "Fijo", "Nivelar (máx.)")
+
+    def cfg_dict(self, clave):
+        try:
+            v = json.loads(self.db.cfg(clave, "{}"))
+            return v if isinstance(v, dict) else {}
+        except ValueError:
+            return {}
+
+    def _ui_volumenes(self, f):
+        lf = ttk.LabelFrame(f, text="Volúmenes fijos y nivelador (para que todo suene siempre igual)",
+                            padding=8)
+        lf.pack(fill="x", padx=10, pady=(2, 6))
+        self.v_bloqueo = tk.IntVar(value=1 if self.db.cfg("vol_bloqueo", "0") == "1" else 0)
+        ttk.Checkbutton(lf, text="Mantener los volúmenes en los valores fijados "
+                                 "(desmárcalo para poder cambiarlos a mano)",
+                        variable=self.v_bloqueo, command=self.cambiar_bloqueo).grid(
+            row=0, column=0, columnspan=8, sticky="w")
+        maestro = self.db.cfg("vol_maestro", "")
+        self.v_maestro_on = tk.IntVar(value=1 if maestro != "" else 0)
+        self.v_maestro = tk.StringVar(value=maestro or "70")
+        ttk.Checkbutton(lf, text="Volumen general de Windows al", variable=self.v_maestro_on,
+                        command=self.guardar_maestro).grid(row=1, column=0, sticky="w", pady=3)
+        sp = ttk.Spinbox(lf, from_=0, to=100, increment=5, width=5, textvariable=self.v_maestro,
+                         command=self.guardar_maestro)
+        sp.grid(row=1, column=1, sticky="w")
+        sp.bind("<FocusOut>", lambda e: self.guardar_maestro())
+        sp.bind("<Return>", lambda e: self.guardar_maestro())
+        ttk.Label(lf, text="%").grid(row=1, column=2, sticky="w")
+        self.lbl_vol_app = ttk.Label(lf, text="App elegida en la lista: (ninguna)",
+                                     font=("Segoe UI", 9, "bold"))
+        self.lbl_vol_app.grid(row=2, column=0, columnspan=8, sticky="w", pady=(6, 0))
+        self.v_vol_pct = tk.StringVar(value="50")
+        self.v_vol_modo = tk.StringVar(value=self.MODOS_VOL[0])
+        ttk.Label(lf, text="Volumen:").grid(row=3, column=0, sticky="e")
+        ttk.Spinbox(lf, from_=1, to=100, increment=5, width=5, textvariable=self.v_vol_pct).grid(
+            row=3, column=1, sticky="w")
+        ttk.Label(lf, text="%   Modo:").grid(row=3, column=2, sticky="w")
+        ttk.Combobox(lf, textvariable=self.v_vol_modo, values=self.MODOS_VOL, state="readonly",
+                     width=16).grid(row=3, column=3, sticky="w", padx=4)
+        ttk.Button(lf, text="Aplicar a esta app", command=self.aplicar_vol_app).grid(
+            row=3, column=4, padx=8)
+        self.v_objetivo = tk.StringVar(value=self.db.cfg("vol_objetivo", "-18"))
+        ttk.Label(lf, text="Nivel de salida objetivo (siempre negativo: -3 = casi el máximo, "
+                           "-30 = muy bajo):").grid(
+            row=4, column=0, columnspan=2, sticky="e", pady=(6, 0))
+        so = ttk.Spinbox(lf, from_=-50, to=-3, increment=1, width=5, textvariable=self.v_objetivo,
+                         command=self.guardar_objetivo)
+        so.grid(row=4, column=2, sticky="w", pady=(6, 0))
+        so.bind("<FocusOut>", lambda e: self.guardar_objetivo())
+        so.bind("<Return>", lambda e: self.guardar_objetivo())
+        ttk.Label(lf, text="dB").grid(row=4, column=3, sticky="w", pady=(6, 0))
+        ttk.Button(lf, text="Tomar el nivel de la app en pantalla",
+                   command=self.tomar_nivel_actual).grid(row=4, column=4, columnspan=3, padx=8,
+                                                         pady=(6, 0))
+        self.lbl_vol_estado = ttk.Label(lf, text="", justify="left")
+        self.lbl_vol_estado.grid(row=5, column=0, columnspan=8, sticky="w", pady=(6, 0))
+        ttk.Label(lf, foreground="#888888", justify="left", text=(
+            "Fijo: el volumen de la app se vuelve a poner si alguien lo mueve.  Nivelar: el volumen "
+            "sube y baja solo para que la salida quede siempre en el nivel objetivo; el % es el máximo.\n"
+            "El control de volumen que está dentro de la app (el de YouTube Music, por ejemplo) no se "
+            "puede tocar desde fuera, pero el nivelador compensa lo que ese control cambie."),
+        ).grid(row=6, column=0, columnspan=8, sticky="w", pady=(4, 0))
+        self._estado_vol()
+
+    @staticmethod
+    def _txt_fijado(d):
+        if not d:
+            return ""
+        return ("%d %% fijo" % d["pct"]) if d.get("modo") == "fijo" else "nivela, máx. %d %%" % d["pct"]
+
+    def _estado_vol(self):
+        apps = self.cfg_dict("vol_apps")
+        if self.db.cfg("vol_bloqueo", "0") == "1":
+            n = len(apps) + (1 if self.db.cfg("vol_maestro", "") != "" else 0)
+            txt, col = ("Bloqueo ACTIVO: %d volumen(es) se mantienen solos." % n if n else
+                        "Bloqueo activo, pero no hay volúmenes fijados todavía."), "#1e8449"
+        else:
+            txt, col = ("Bloqueo desactivado: los volúmenes se pueden cambiar a mano. Lo fijado "
+                        "queda guardado, pero no se aplica."), "#b9770e"
+        self.lbl_vol_estado.config(text=txt, foreground=col)
+
+    def cambiar_bloqueo(self):
+        on = bool(self.v_bloqueo.get())
+        self.db.set_cfg("vol_bloqueo", "1" if on else "0")
+        self._niveladores = {}
+        self._vol_t_cfg = 0.0
+        self.log("Bloqueo de volúmenes %s." % (
+            "ACTIVADO" if on else "desactivado (se pueden cambiar a mano)"))
+        self._estado_vol()
+
+    def guardar_maestro(self):
+        if self.v_maestro_on.get():
+            try:
+                pct = max(0, min(100, int(float(self.v_maestro.get().replace(",", ".")))))
+            except ValueError:
+                return
+            self.v_maestro.set(str(pct))
+            self.db.set_cfg("vol_maestro", str(pct))
+        else:
+            self.db.set_cfg("vol_maestro", "")
+        self._vol_t_cfg = 0.0
+        self._estado_vol()
+
+    def guardar_objetivo(self):
+        try:
+            v = max(-50.0, min(-3.0, float(self.v_objetivo.get().replace(",", "."))))
+        except ValueError:
+            return
+        self.v_objetivo.set("%g" % v)
+        self.db.set_cfg("vol_objetivo", "%g" % v)
+        self._niveladores = {}
+        self._vol_t_cfg = 0.0
+
+    def tomar_nivel_actual(self):
+        if self.app_meter is None or self.app_out_pico < VU_MIN + 6:
+            messagebox.showinfo(
+                "Nivel actual", "Elige una app en la lista (un clic) y ponla a sonar: se toma el "
+                "pico reciente de su salida, que es lo que se ve en el medidor de la pantalla "
+                "principal.", parent=self.root)
+            return
+        v = max(-50.0, min(-3.0, round(self.app_out_pico)))
+        self.v_objetivo.set("%g" % v)
+        self.guardar_objetivo()
+        self.log("Nivel objetivo del nivelador: %g dB (tomado de %s)." % (v, self.app_clave))
+
+    def _cargar_vol_app(self, clave):
+        d = self.cfg_dict("vol_apps").get(clave)
+        self.lbl_vol_app.config(text="App elegida en la lista: %s" % clave.rsplit(".", 1)[0])
+        self.v_vol_pct.set(str(d["pct"]) if d else self.v_vol_pct.get())
+        self.v_vol_modo.set(self.MODOS_VOL[{"fijo": 1, "nivelar": 2}.get(d["modo"], 0)] if d
+                            else self.MODOS_VOL[0])
+
+    def aplicar_vol_app(self):
+        s = self.tree_apps.selection()
+        if not s:
+            messagebox.showinfo("Volumen", "Elige primero una app de la lista (un clic).",
+                                parent=self.root)
+            return
+        try:
+            pct = max(1, min(100, int(float(self.v_vol_pct.get().replace(",", ".")))))
+        except ValueError:
+            messagebox.showwarning("Volumen", "Escribe el volumen como un número del 1 al 100.",
+                                   parent=self.root)
+            return
+        modo = self.MODOS_VOL.index(self.v_vol_modo.get())
+        d = self.cfg_dict("vol_apps")
+        if modo == 0:
+            d.pop(s[0], None)
+        else:
+            d[s[0]] = {"pct": pct, "modo": "fijo" if modo == 1 else "nivelar"}
+        self.db.set_cfg("vol_apps", json.dumps(d))
+        self._niveladores = {}
+        self._vol_t_cfg = 0.0
+        self.log("Volumen de %s: %s." % (s[0], "libre" if modo == 0 else (
+            "fijo al %d %%" % pct if modo == 1 else "nivelado, hasta el %d %%" % pct)))
+        self.refrescar_apps()
+        self._estado_vol()
+
+    def _log_vol(self, clave, texto):
+        """Una línea por app como máximo cada minuto (si no, un volumen que alguien mueve sin
+        parar llenaría el registro)."""
+        ahora = time.time()
+        if ahora - self._vol_log_t.get(clave, 0.0) > 60.0:
+            self._vol_log_t[clave] = ahora
+            self.log(texto)
+
+    def _sesiones_fijadas(self, apps):
+        res = []
+        try:
+            for s in AudioUtilities.GetAllSessions():
+                try:
+                    if s.Process is None or s.ProcessId == os.getpid() or es_sonido_sistema(s):
+                        continue
+                    clave = s.Process.name().lower()
+                    if clave not in apps:
+                        continue
+                    meter = s._ctl.QueryInterface(IAudioMeterInformation) \
+                        if IAudioMeterInformation is not None else None
+                    res.append((s.ProcessId, clave, s.SimpleAudioVolume, meter))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return res
+
+    def _ciclo_volumenes(self):
+        """Cada 60 ms. Con el bloqueo activo: mantiene el volumen general de Windows y el de las
+        apps «Fijo», y mueve el de las apps «Nivelar» según su señal."""
+        try:
+            self._volumenes(time.time())
+        except Exception as e:
+            clave = motivo_error(e)
+            if clave != getattr(self, "_ult_error_vol", None):
+                self._ult_error_vol = clave
+                self.log("Error en el bloqueo de volúmenes (se sigue funcionando): " + clave)
+        self.root.after(60, self._ciclo_volumenes)
+
+    def _volumenes(self, ahora):
+        if AudioUtilities is None:
+            return
+        if ahora - self._vol_t_cfg > 1.0:           # una vez por segundo: config, sesiones y general
+            self._vol_t_cfg = ahora
+            try:
+                objetivo = float(self.db.cfg("vol_objetivo", "-18"))
+            except ValueError:
+                objetivo = -18.0
+            m = self.db.cfg("vol_maestro", "")
+            self._volcfg = dict(
+                bloqueo=self.db.cfg("vol_bloqueo", "0") == "1",
+                maestro=int(m) if m.isdigit() else None,
+                apps=self.cfg_dict("vol_apps"), objetivo=objetivo)
+            c = self._volcfg
+            if c["bloqueo"] and c["maestro"] is not None:
+                antes = volumen_maestro(c["maestro"] / 100.0)
+                if antes is not None and abs(antes - c["maestro"] / 100.0) > 0.01:
+                    self._log_vol("(general)", "Volumen general de Windows corregido: estaba al %d %%, "
+                                  "vuelve al %d %%." % (round(antes * 100), c["maestro"]))
+            self._vol_ses = self._sesiones_fijadas(c["apps"]) if (c["bloqueo"] and c["apps"]) else []
+            nombres = sorted({x[1] for x in self._vol_ses})
+            if nombres != getattr(self, "_vol_nombres", None):      # solo cuando cambia
+                self._vol_nombres = nombres
+                if nombres:
+                    self.log("Volúmenes fijados/nivelados: sesión(es) de audio encontrada(s): %s." % ", ".join(nombres))
+                if TRAZA_VOL is not None:
+                    TRAZA_VOL.write("%.2f,sesiones,%s,,,\n" % (ahora, "+".join(nombres) or "ninguna"))
+        c = self._volcfg
+        if not c or not c["bloqueo"] or not self._vol_ses:
+            self._vol_t_prev = ahora
+            return
+        if self.rep.duck_o > 0.0:                   # suena un audio que baja a las otras apps: no se toca
+            self._vol_t_prev = ahora
+            return
+        dt = min(0.25, max(0.001, ahora - self._vol_t_prev))
+        self._vol_t_prev = ahora
+        caidas = []
+        for pid, clave, vol, meter in self._vol_ses:
+            cfg = c["apps"].get(clave)
+            if not cfg:
+                continue
+            try:
+                objetivo_v = max(0.01, min(1.0, cfg["pct"] / 100.0))
+                actual = vol.GetMasterVolume()
+                if cfg["modo"] == "fijo":
+                    if abs(actual - objetivo_v) > 0.01:
+                        vol.SetMasterVolume(objetivo_v, None)
+                        self._log_vol(clave, "Volumen de %s corregido: estaba al %d %%, vuelve al "
+                                      "%d %%." % (clave, round(actual * 100), round(objetivo_v * 100)))
+                elif meter is not None:
+                    niv = self._niveladores.get(pid)
+                    if niv is None:
+                        niv = self._niveladores[pid] = Nivelador(c["objetivo"], 0.03, objetivo_v)
+                    pico = meter.GetPeakValue()
+                    nuevo = niv.paso(pico, actual, dt)
+                    if abs(nuevo - actual) > 0.003:
+                        vol.SetMasterVolume(max(0.0, min(1.0, nuevo)), None)
+                        actual = nuevo
+                    if TRAZA_VOL is not None:
+                        TRAZA_VOL.write("%.2f,%s,%.1f,%.1f,%.1f,%.1f\n" % (
+                            ahora, clave, Nivelador._db(pico), niv.entrada, actual * 100,
+                            Nivelador._db(pico) + 20.0 * math.log10(max(actual, 1e-4))))
+            except Exception as e:
+                if TRAZA_VOL is not None:
+                    TRAZA_VOL.write("%.2f,error,%s,,,\n" % (ahora, motivo_error(e).replace(",", ";")[:120]))
+                caidas.append(pid)                  # la app se cerró: se vuelve a buscar
+        if caidas:
+            self._vol_ses = [x for x in self._vol_ses if x[0] not in caidas]
+            self._vol_t_cfg = 0.0
 
     def _ciclo_apps(self):
         try:
@@ -2442,6 +2788,7 @@ class App:
     def refrescar_apps(self):
         apps = self._listar_apps()
         excluidas = set(self.cfg_lista("apps_excluir"))
+        fijadas = self.cfg_dict("vol_apps")
         atenuadas = {n.lower() for n in self.rep.atenuadas()}
         sel = self.tree_apps.selection()
         self.tree_apps.delete(*self.tree_apps.get_children())
@@ -2463,7 +2810,8 @@ class App:
             kw = dict(image=self.iconos_apps[ruta]) if ruta and self.iconos_apps.get(ruta) else {}
             self.tree_apps.insert("", "end", iid=clave, text="  " + nombre, tags=tags, values=(
                 ventana[:70], "" if d["vol"] is None else "%d%%" % round(d["vol"] * 100), estado,
-                "No" if clave in excluidas else "Sí"), **kw)
+                "No" if clave in excluidas else "Sí",
+                self._txt_fijado(fijadas.get(clave))), **kw)
         for s_ in (sel or ([self.app_clave] if self.app_clave else [])):
             if self.tree_apps.exists(s_):
                 self._ignorar_sel_app = True
@@ -2481,6 +2829,7 @@ class App:
             return
         s = self.tree_apps.selection()
         if s:
+            self._cargar_vol_app(s[0])
             self.seguir_app(s[0])
 
     def alternar_app(self):
@@ -3203,6 +3552,7 @@ class App:
             except Exception:
                 self.app_meter = self.app_vol = None
         out = pre + (20.0 * math.log10(vol) if vol > 0.001 else -99.0)   # el medidor de Windows lee antes del volumen
+        self.app_out_pico = out if out > self.app_out_pico else max(out, self.app_out_pico - 6.0 * dt_)
         # línea de tope: cuánto bajó su volumen respecto al original (se ve el damper funcionando)
         orig = next((o for p, n, _, o in self.rep.sesiones if p == self.app_pid), None)
         if orig is None:                      # (otra sesión del mismo programa)
@@ -4339,6 +4689,10 @@ def main():
     if "--puerto" in sys.argv:          # solo para pruebas: permite abrir una segunda copia
         PUERTO = int(sys.argv[sys.argv.index("--puerto") + 1])
     minimizado = "--minimizado" in sys.argv
+    if "--traza-volumenes" in sys.argv:         # solo para pruebas: anota cada ajuste del nivelador
+        global TRAZA_VOL
+        TRAZA_VOL = open(sys.argv[sys.argv.index("--traza-volumenes") + 1], "w", buffering=1)
+        TRAZA_VOL.write("t,app,entrada_db,pico_recordado_db,volumen_pct,salida_db\n")
     sock = instancia_unica(not minimizado)
     if sock is None:
         return  # ya hay una copia abierta

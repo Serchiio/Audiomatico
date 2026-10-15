@@ -1,5 +1,13 @@
 # Historial de cambios
 
+## 1.5.0
+Volúmenes fijos y **nivelador automático** de otras apps (pestaña Apps, panel «Volúmenes fijos y nivelador»).
+
+- **Bloqueo de volúmenes.** Se puede fijar el volumen general de Windows (por ejemplo 70 %) y el de cada app (por ejemplo Google al 25 %). Si alguien los mueve, el programa los devuelve a su valor y lo anota en el registro. Desmarcando el bloqueo se pueden cambiar a mano. Mientras suena un audio que baja el volumen de otras apps (prioridad) no se toca nada, para no pelear con el damper.
+- **Nivelador.** Para las apps marcadas «Nivelar», el programa mide su señal y mueve su volumen en el Mezclador para que la salida quede siempre en el nivel objetivo (por defecto -18 dB): baja rápido ante una canción fuerte y sube despacio ante una baja. El % indicado es el máximo. En una pausa o un silencio no cambia nada. Hay un botón «Tomar el nivel actual de la app mostrada en pantalla» para calibrar el objetivo.
+- **Verificado en Windows 7 SP1 de 32 bits con Firefox:** canciones con 12 dB de diferencia de volumen quedan en la salida a menos de 2 dB entre sí; el bloqueo del volumen general de Windows devuelve el valor fijado.
+- **Límites:** el control de volumen que está dentro de una app (el de YouTube Music, por ejemplo) no se puede tocar desde fuera; el nivelador compensa lo que cambie. No ve el futuro: una canción fuerte tras una baja suena un instante por encima del objetivo antes de ajustarse. Una canción muy baja no puede subir más del máximo fijado.
+
 ## 1.4.3
 Corrige la **apertura automática a una hora** y deja constancia en el registro.
 
