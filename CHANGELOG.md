@@ -1,5 +1,11 @@
 # Historial de cambios
 
+## 1.5.1
+Corrige un **cierre inesperado en Windows 7** y un fallo del nivelador a volumen bajo.
+
+- **El programa ya no se cierra solo** cuando está activado «Volumen general de Windows al…». Al leer ese volumen se liberaba un objeto del sistema dos veces, y en Windows 7 acababa cerrando el programa a los pocos segundos o minutos.
+- **El nivelador ya se recupera a volumen bajo.** Con el volumen de una app por debajo del 20 %, los pasos de subida eran tan pequeños que se descartaban: tras una canción más baja o con la barra de volumen de la página bajada, el volumen casi no subía. Ahora sube al ritmo previsto (unos segundos).
+
 ## 1.5.0
 Volúmenes fijos y **nivelador automático** de otras apps (pestaña Apps, panel «Volúmenes fijos y nivelador»).
 

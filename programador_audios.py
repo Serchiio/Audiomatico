@@ -51,7 +51,7 @@ except Exception:
 
 APP = "ProgramadorAudios"   # nombre interno: carpeta de datos, registro y tarea (no cambiar)
 NOMBRE = "Audiomático"      # nombre que ve el usuario
-VERSION = "1.5.0"          # igual que en instalador.iss
+VERSION = "1.5.1"          # igual que en instalador.iss
 # colores de categoría (se asignan solos, rotando) y fuente exclusiva de la prioridad
 PALETA = ["#d9534f", "#f0ad4e", "#5cb85c", "#3ea6c4", "#6f7bd9", "#a463c9", "#e0679a",
           "#8d6e63"]
@@ -845,6 +845,7 @@ class VolumenWindows:
 
     def _buscar(self):
         """La sesión de audio de este programa aparece cuando abre la tarjeta de sonido."""
+        retener_caidos(self.vol)
         self.vol = None
         if AudioUtilities is None:
             return
@@ -870,6 +871,7 @@ class VolumenWindows:
             v = self.vol.GetMasterVolume()
             return v * 100.0, (20.0 * math.log10(v) if v > 0.001 else -99.0)
         except Exception:
+            retener_caidos(self.vol)
             self.vol = None
             return None
 
@@ -879,6 +881,7 @@ class VolumenWindows:
         try:
             self.vol.SetMasterVolume(max(0.0, min(1.0, pct / 100.0)), None)
         except Exception:
+            retener_caidos(self.vol)
             self.vol = None
 
 
@@ -888,12 +891,13 @@ def volumen_maestro(nuevo=None):
     if AudioUtilities is None:
         return None
     try:
-        from ctypes import cast, POINTER
         from comtypes import CLSCTX_ALL
         from pycaw.pycaw import IAudioEndpointVolume
         disp = AudioUtilities.GetSpeakers()
         iface = disp.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        vol = cast(iface, POINTER(IAudioEndpointVolume))
+        # v1.5.1: QueryInterface suma su propia referencia. Con ctypes.cast (como en los ejemplos de pycaw) no: el objeto se soltaba DOS veces,
+        # y la segunda era una violación de acceso en comtypes (Release) cada segundo: en Windows 7 acababa cerrando el programa (fallos.txt).
+        vol = iface.QueryInterface(IAudioEndpointVolume)
         actual = vol.GetMasterVolumeLevelScalar()
         if nuevo is not None and abs(actual - nuevo) > 0.005:
             vol.SetMasterVolumeLevelScalar(max(0.0, min(1.0, nuevo)), None)
@@ -1455,6 +1459,8 @@ class Reproductor:
                 pass
         if self.sesiones and self.persistir:
             self.persistir(None)
+        for _p, _n, _v, _o in self.sesiones:
+            retener_caidos(_v)
         self.sesiones = []
         self.sesiones_cap = False
         self.mult_otros = 1.0
@@ -1881,6 +1887,35 @@ try:
     import psutil
 except Exception:
     psutil = None
+
+
+# v1.5.1: en Windows 7 soltar un puntero COM de una sesión de audio que ya expiró (Firefox cambia de canción y su sesión desaparece)
+# puede provocar una violación de acceso dentro de comtypes (fallos.txt: «comtypes/__init__.py Release»), que cerraba el programa.
+# Los punteros que se guardan mucho tiempo (volumen y medidor de una app) se sueltan solo si siguen vivos; los caídos se
+# guardan aquí para siempre (son pocos: uno por cada vez que una sesión desaparece).
+_CEMENTERIO = []
+
+
+def _com_vivo(*punteros):
+    """True si todos los punteros de volumen/medidor siguen respondiendo."""
+    for p in punteros:
+        if p is None:
+            continue
+        try:
+            if hasattr(p, "GetMasterVolume"):
+                p.GetMasterVolume()
+            elif hasattr(p, "GetPeakValue"):
+                p.GetPeakValue()
+        except Exception:
+            return False
+    return True
+
+
+def retener_caidos(*punteros):
+    """Llamar ANTES de soltar punteros COM guardados: los que ya no responden no se sueltan (se quedan en _CEMENTERIO)."""
+    for p in punteros:
+        if p is not None and not _com_vivo(p):
+            _CEMENTERIO.append(p)
 
 
 def es_sonido_sistema(s):
@@ -2694,6 +2729,8 @@ class App:
                 if antes is not None and abs(antes - c["maestro"] / 100.0) > 0.01:
                     self._log_vol("(general)", "Volumen general de Windows corregido: estaba al %d %%, "
                                   "vuelve al %d %%." % (round(antes * 100), c["maestro"]))
+            for _x in self._vol_ses:
+                retener_caidos(_x[2], _x[3])
             self._vol_ses = self._sesiones_fijadas(c["apps"]) if (c["bloqueo"] and c["apps"]) else []
             nombres = sorted({x[1] for x in self._vol_ses})
             if nombres != getattr(self, "_vol_nombres", None):      # solo cuando cambia
@@ -2730,7 +2767,9 @@ class App:
                         niv = self._niveladores[pid] = Nivelador(c["objetivo"], 0.03, objetivo_v)
                     pico = meter.GetPeakValue()
                     nuevo = niv.paso(pico, actual, dt)
-                    if abs(nuevo - actual) > 0.003:
+                    # v1.5.1: el umbral es relativo (0,05 dB), no fijo: con 0,003 a volumen bajo (10 %) cada paso de subida (3 dB/s a 60 ms = 0,002)
+                    # se descartaba siempre y el volumen casi no se recuperaba tras una canción más baja o la barra de la página bajada.
+                    if abs(Nivelador._db(max(nuevo, 1e-4)) - Nivelador._db(max(actual, 1e-4))) > 0.05:
                         vol.SetMasterVolume(max(0.0, min(1.0, nuevo)), None)
                         actual = nuevo
                     if TRAZA_VOL is not None:
@@ -2742,6 +2781,9 @@ class App:
                     TRAZA_VOL.write("%.2f,error,%s,,,\n" % (ahora, motivo_error(e).replace(",", ";")[:120]))
                 caidas.append(pid)                  # la app se cerró: se vuelve a buscar
         if caidas:
+            for _x in self._vol_ses:
+                if _x[0] in caidas:
+                    _CEMENTERIO.extend(p for p in (_x[2], _x[3]) if p is not None)      # ya fallaron: no se sueltan
             self._vol_ses = [x for x in self._vol_ses if x[0] not in caidas]
             self._vol_t_cfg = 0.0
 
@@ -3468,6 +3510,7 @@ class App:
             return
         self.app_clave = clave
         self.db.set_cfg("app_seguir", clave)
+        retener_caidos(self.app_meter, self.app_vol)
         self.app_meter = self.app_vol = None
         self.app_pid = None
         self.app_t_lento = 0.0
@@ -3501,12 +3544,17 @@ class App:
         ruta = None
         if mejor:
             s, m = mejor
-            self.app_meter, self.app_vol, self.app_pid = m, s.SimpleAudioVolume, s.ProcessId
+            if self.app_meter is not None and self.app_pid == s.ProcessId and _com_vivo(self.app_vol, self.app_meter):
+                pass                    # sigue siendo la misma sesión: se conservan sus punteros (no se recrean cada segundo)
+            else:
+                retener_caidos(self.app_meter, self.app_vol)
+                self.app_meter, self.app_vol, self.app_pid = m, s.SimpleAudioVolume, s.ProcessId
             try:
                 ruta = s.Process.exe()
             except Exception:
                 ruta = None
         else:
+            retener_caidos(self.app_meter, self.app_vol)
             self.app_meter = self.app_vol = self.app_pid = None
         if not ruta:
             for r in self.cfg_lista("apps_manuales"):
@@ -3550,6 +3598,7 @@ class App:
                 pre = 20.0 * math.log10(p) if p > 1e-5 else VU_MIN
                 vol = self.app_vol.GetMasterVolume()
             except Exception:
+                retener_caidos(self.app_meter, self.app_vol)
                 self.app_meter = self.app_vol = None
         out = pre + (20.0 * math.log10(vol) if vol > 0.001 else -99.0)   # el medidor de Windows lee antes del volumen
         self.app_out_pico = out if out > self.app_out_pico else max(out, self.app_out_pico - 6.0 * dt_)

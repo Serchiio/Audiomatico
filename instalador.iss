@@ -1,6 +1,6 @@
 ﻿; Instalador de Audiomático (Inno Setup). Se compila con compilar.bat, que genera las dos variantes.
 #define Nombre "Audiomático"
-#define Version "1.5.0"
+#define Version "1.5.1"
 #define Exe "Audiomatico.exe"
 ; Variante: /DVariante=win7  -> 32 bits, SIN winsdk. Sirve en todo Windows (7, 8, 10, 11).
 ;           /DVariante=win10 -> con winsdk (artista y duración de otras apps). Solo Windows 10/11.
