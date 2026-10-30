@@ -1,5 +1,14 @@
 # Historial de cambios
 
+## 1.6.0
+**Pestaña Niveles** y un nivelador que **recuerda las canciones** y se anticipa a sus picos.
+
+- **Pestaña Niveles.** Una fila por cada app en modo «Nivelar», con su barra de salida en vivo. La **línea blanca es el tope en dB y se arrastra con el ratón** (cada app tiene el suyo); debajo, una barra naranja muestra el **volumen que el nivelador le va dando**, con la flecha ▲ subiendo / ▼ bajando. Desde ahí se añade o se quita una app del nivelador. La pestaña Apps sigue igual.
+- **Reacción casi instantánea.** El nivelador revisa la señal cada 30 ms (antes 60) y baja el volumen casi al instante: un golpe fuerte inesperado se corrige en un paso, no en seis.
+- **Memoria de canciones.** El programa recuerda por nombre cada canción (por ejemplo la de YouTube Music en el navegador) y, para cada medio segundo, el pico de su señal. La segunda vez que suena ya sabe dónde están sus picos: **baja el volumen antes de que lleguen**, empieza la canción ya en el volumen correcto y sube más rápido cuando sabe que viene un tramo tranquilo. Cada reproducción afina el perfil (se queda con el máximo y olvida 1 dB por vez para que un ruido suelto no lo estropee). Se ve y se borra en la lista «Memoria de canciones» de la pestaña (hasta 3000 canciones).
+- **Solo aprende de fuentes fiables.** En un navegador solo se fía de la ventana si es YouTube Music (si cambias de pestaña, sigue siendo la misma canción); en Windows 10/11 usa el título y el artista que da el sistema. Sin título fiable el nivelador funciona como siempre, sin memoria. Se puede apagar con «Recordar canciones y anticiparse a sus picos».
+- **Límites que siguen igual:** el programa mueve el volumen de la app en el Mezclador de Windows, no el sonido en sí; una canción desconocida todavía deja pasar el primer instante de un golpe, y una canción más baja que el tope no se puede subir por encima del 100 %.
+
 ## 1.5.1
 Corrige un **cierre inesperado en Windows 7** y un fallo del nivelador a volumen bajo.
 
