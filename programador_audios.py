@@ -51,7 +51,7 @@ except Exception:
 
 APP = "ProgramadorAudios"   # nombre interno: carpeta de datos, registro y tarea (no cambiar)
 NOMBRE = "Audiomático"      # nombre que ve el usuario
-VERSION = "1.5.1"          # igual que en instalador.iss
+VERSION = "1.6.0"          # igual que en instalador.iss
 # colores de categoría (se asignan solos, rotando) y fuente exclusiva de la prioridad
 PALETA = ["#d9534f", "#f0ad4e", "#5cb85c", "#3ea6c4", "#6f7bd9", "#a463c9", "#e0679a",
           "#8d6e63"]
@@ -100,6 +100,10 @@ class BD:
             fecha_fin TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS config(
             clave TEXT PRIMARY KEY, valor TEXT);
+        CREATE TABLE IF NOT EXISTS perfiles(
+            clave_app TEXT NOT NULL, cancion TEXT NOT NULL, env TEXT NOT NULL,
+            veces INTEGER DEFAULT 1, pico REAL, actualizado TEXT,
+            PRIMARY KEY(clave_app, cancion));
         """)
         # columnas de la nivelación de volumen (bases de datos antiguas)
         for col, tipo in (("ruta_norm", "TEXT DEFAULT ''"), ("nivel_db", "REAL"),
@@ -915,7 +919,8 @@ class Nivelador:
     No ve el futuro: una canción fuerte suena fuerte durante una fracción de segundo."""
     BAJA_ENTRADA = 6.0      # dB/s que tarda en olvidarse un pico
     SUBE_VOL = 3.0          # dB/s máximo al SUBIR el volumen
-    BAJA_VOL = 60.0         # dB/s máximo al BAJAR el volumen (una canción fuerte tras una baja)
+    SUBE_VOL_CONOCIDA = 9.0  # ídem si la canción ya se conoce (se sabe que no viene un pico)
+    BAJA_VOL = 240.0        # dB/s máximo al BAJAR el volumen: casi al instante (1.5: era 60)
     SILENCIO = -55.0        # dB: por debajo no hay nada que medir (pausa, hueco entre canciones)
 
     def __init__(self, objetivo_db=-18.0, vmin=0.03, vmax=1.0):
@@ -929,25 +934,121 @@ class Nivelador:
     def _db(x):
         return 20.0 * math.log10(x) if x > 1e-5 else -99.0
 
-    def paso(self, pico, v_actual, dt):
-        """pico: 0..1 leído antes del volumen. Devuelve el volumen (0..1) que debe tener ya."""
+    def paso(self, pico, v_actual, dt, previsto=None, saltar=False):
+        """pico: 0..1 leído antes del volumen. Devuelve el volumen (0..1) que debe tener ya.
+        previsto: pico (dB) que la memoria espera en los próximos segundos de esta canción (None si
+        no se conoce): el volumen baja ANTES de que llegue, en vez de reaccionar cuando ya sonó.
+        saltar: pone ya el volumen exacto (inicio de una canción conocida), sin rampa."""
         if v_actual > self.vmax:
             return self.vmax                   # el máximo es un tope: no se negocia
         nivel = self._db(pico)
+        conocido = previsto is not None and previsto > self.SILENCIO
         if nivel < self.SILENCIO:              # pausa o hueco entre canciones: se congela todo
             self.mudo += dt                    # (si no, al olvidar el pico el volumen se dispararía)
-            return max(self.vmin, v_actual)
-        self.mudo = 0.0
-        self.entrada = nivel if nivel > self.entrada else max(nivel, self.entrada - self.BAJA_ENTRADA * dt)
-        if self.entrada < self.SILENCIO:
+            if not (conocido and saltar):
+                return max(self.vmin, v_actual)
+        else:
+            self.mudo = 0.0
+            self.entrada = nivel if nivel > self.entrada else max(nivel, self.entrada - self.BAJA_ENTRADA * dt)
+        if conocido:                           # el mayor entre lo que se oye y lo que se espera
+            ref = max(previsto, nivel if nivel >= self.SILENCIO else -99.0)
+        elif self.entrada < self.SILENCIO:
             return max(self.vmin, v_actual)    # nada que medir: se deja como está
+        else:
+            ref = self.entrada
         v_db = self._db(max(v_actual, 1e-4))
-        deseado = min(max(self.objetivo - self.entrada, self._db(self.vmin)), self._db(self.vmax))
-        if deseado < v_db:
+        deseado = min(max(self.objetivo - ref, self._db(self.vmin)), self._db(self.vmax))
+        if saltar:
+            v_db = deseado
+        elif deseado < v_db:
             v_db = max(deseado, v_db - self.BAJA_VOL * dt)
         else:
-            v_db = min(deseado, v_db + self.SUBE_VOL * dt)
+            v_db = min(deseado, v_db + (self.SUBE_VOL_CONOCIDA if conocido else self.SUBE_VOL) * dt)
         return 10.0 ** (v_db / 20.0)
+
+
+CUBO_S = 0.5                    # la memoria guarda el pico de la señal cada medio segundo
+MAX_CUBOS = 3600                # 30 minutos de canción como máximo
+
+
+class PerfilCancion:
+    """Lo que se sabe de una canción: el pico de su señal (antes del volumen) cada medio segundo.
+    Se afina con cada reproducción: se queda con el máximo visto, olvidando 1 dB por vez para que
+    un ruido suelto (un aviso, un anuncio) no deje el perfil demasiado alto para siempre."""
+
+    def __init__(self, env=None, veces=0):
+        self.env = list(env) if env else []
+        self.veces = veces
+
+    @property
+    def pico(self):
+        return max(self.env) if self.env else -99.0
+
+    def previsto(self, t, antes=1.0, despues=1.5):
+        """Pico (dB) esperado entre t-antes y t+despues segundos (la ventana absorbe que el reloj
+        de la canción no esté clavado). None si no hay datos para ese momento."""
+        if not self.env:
+            return None
+        i0 = int(max(0.0, t - antes) / CUBO_S)
+        if i0 >= len(self.env):
+            return None
+        i1 = min(len(self.env) - 1, int(max(0.0, t + despues) / CUBO_S))
+        return max(self.env[i0:i1 + 1])
+
+    def aprender(self, obs):
+        """obs: {número de cubo: pico dB} de una reproducción."""
+        n = min(MAX_CUBOS, max(obs) + 1) if obs else 0
+        n = max(n, len(self.env))
+        env = self.env + [-99.0] * (n - len(self.env))
+        for i, o in obs.items():
+            if i >= MAX_CUBOS:
+                continue
+            viejo = env[i]
+            env[i] = round(o if viejo <= -98.0 else max(o, viejo - 1.0), 1)
+        self.env = env
+        self.veces += 1
+
+
+class Rastreador:
+    """Sigue la canción que suena en una app: su reloj (solo corre mientras hay sonido, así una
+    pausa lo congela), lo que se oye y lo que la memoria ya sabe de ella."""
+
+    def __init__(self, cargar, guardar, aprender=True):
+        self.cargar, self.guardar = cargar, guardar     # cargar(título)->PerfilCancion|None
+        self.aprende = aprender
+        self.titulo, self.t, self.obs, self.perfil = None, 0.0, {}, None
+        self.nueva = False                              # primer paso de una canción nueva
+
+    def cambiar(self, titulo):
+        if titulo == self.titulo:
+            return
+        self.cerrar()
+        self.titulo, self.t, self.obs = titulo, 0.0, {}
+        self.perfil = self.cargar(titulo) if titulo else None
+        self.nueva = self.perfil is not None
+
+    def paso(self, pico_db, dt):
+        """Avanza el reloj y devuelve el pico (dB) que se espera ahora, o None si no se conoce."""
+        if self.titulo is None:
+            return None
+        if pico_db > Nivelador.SILENCIO:
+            self.t += dt
+            b = int(self.t / CUBO_S)
+            if b < MAX_CUBOS and pico_db > self.obs.get(b, -99.0):
+                self.obs[b] = round(pico_db, 1)
+        return self.perfil.previsto(self.t) if self.perfil else None
+
+    def cerrar(self):
+        """La canción terminó (o se dejó de seguir): se funde lo oído con lo que ya se sabía."""
+        if self.aprende and self.titulo and len(self.obs) >= 10:     # al menos 5 s de sonido
+            p = self.perfil or PerfilCancion()
+            p.aprender(self.obs)
+            self.perfil = p
+            try:
+                self.guardar(self.titulo, p)
+            except Exception:
+                pass
+        self.obs = {}
 
 
 # ----------------------------------------------------------------------
@@ -2279,6 +2380,131 @@ class VisorRegistro(tk.Toplevel):
 
 
 # ----------------------------------------------------------------------
+# Pestaña Niveles: una fila por app que se nivela
+# ----------------------------------------------------------------------
+class FilaNivel:
+    """Barra de SALIDA en vivo con el TOPE arrastrable (la línea blanca) y, debajo, el 'damper':
+    cuánto está bajando o subiendo el nivelador el volumen de la app. Clic o arrastre en la barra
+    = mover el tope de esa app."""
+    X0 = 10
+
+    def __init__(self, app, padre, clave, nombre, icono):
+        self.app, self.clave = app, clave
+        self.f = ttk.Frame(padre, relief="groove", borderwidth=2, padding=6)
+        cab = ttk.Frame(self.f)
+        cab.pack(fill="x")
+        self.icono = icono
+        if icono:
+            ttk.Label(cab, image=icono).pack(side="left")
+        ttk.Label(cab, text=" " + nombre, font=("Segoe UI", 10, "bold")).pack(side="left")
+        self.lbl_estado = ttk.Label(cab, text="", foreground="#888888")
+        self.lbl_estado.pack(side="left", padx=12)
+        ttk.Button(cab, text="Quitar", width=8,
+                   command=lambda: app.quitar_nivelado(clave)).pack(side="right")
+        self.cv = tk.Canvas(self.f, height=88, bg=VU_FONDO, highlightthickness=0,
+                            cursor="sb_h_double_arrow")
+        self.cv.pack(fill="x", pady=(4, 2))
+        self.lbl_cancion = ttk.Label(self.f, text="", foreground="#555555")
+        self.lbl_cancion.pack(anchor="w")
+        self.out = VU_MIN
+        self.vol_prev = None
+        self.sube = 0                        # -1 bajando, 1 subiendo, 0 quieto (se mantiene un rato)
+        self.sube_t = 0.0
+        self.cv.bind("<Button-1>", lambda e: self._mover(e, False))
+        self.cv.bind("<B1-Motion>", lambda e: self._mover(e, False))
+        self.cv.bind("<ButtonRelease-1>", lambda e: self._mover(e, True))
+
+    def _x(self, db):
+        w = max(240, self.cv.winfo_width())
+        db = max(VU_MIN, min(VU_MAX, db))
+        return self.X0 + (db - VU_MIN) / (VU_MAX - VU_MIN) * (w - 2 * self.X0)
+
+    def _db_de_x(self, x):
+        w = max(240, self.cv.winfo_width())
+        return VU_MIN + (x - self.X0) / float(w - 2 * self.X0) * (VU_MAX - VU_MIN)
+
+    def _mover(self, e, fin):
+        self.app.nivel_arrastre(self.clave, self._db_de_x(e.x), fin)
+
+    def dibujar(self, vivo, dt, ahora, objetivo_cfg):
+        cv = self.cv
+        cv.delete("all")
+        w = max(240, cv.winfo_width())
+        vivo_ok = vivo is not None and ahora - vivo["ahora"] < 1.5
+        objetivo = vivo["objetivo"] if vivo_ok else objetivo_cfg
+        pre = vivo["pre"] if vivo_ok else VU_MIN
+        vol = vivo["vol"] if vivo_ok else None
+        out = (max(pre, VU_MIN) + (20.0 * math.log10(vol) if vol and vol > 0.001 else -99.0)) if vivo_ok else VU_MIN
+        self.out = out if out > self.out else max(out, self.out - 45.0 * dt)
+        # --- barra de salida (verde / amarillo / rojo) y de entrada (fina) ---
+        cv.create_text(self.X0, 6, text="SALIDA", fill="#8a939e", font=("Segoe UI", 7), anchor="w")
+        cv.create_rectangle(self._x(VU_MIN), 14, self._x(VU_MAX), 34, fill="#262b32", outline="")
+        desde = VU_MIN
+        for hasta, col in ((-14.0, "#2ecc71"), (-5.0, "#f1c40f"), (VU_MAX, "#e74c3c")):
+            if self.out > desde:
+                cv.create_rectangle(self._x(desde), 14, self._x(min(self.out, hasta)), 34, fill=col, outline="")
+            desde = hasta
+        cv.create_rectangle(self._x(VU_MIN), 38, self._x(VU_MAX), 44, fill="#262b32", outline="")
+        if pre > VU_MIN:
+            cv.create_rectangle(self._x(VU_MIN), 38, self._x(pre), 44, fill="#4a78b0", outline="")
+        cv.create_text(w - self.X0, 6, text="ENTRADA (fina)", fill="#4a78b0", font=("Segoe UI", 7), anchor="e")
+        # --- pico que la memoria espera ahora ---
+        if vivo_ok and vivo["previsto"] is not None and vivo["previsto"] > VU_MIN:
+            xp = self._x(vivo["previsto"])
+            cv.create_polygon(xp - 4, 36, xp + 4, 36, xp, 30, fill="#e67e22", outline="")
+        # --- el tope (arrastrable) ---
+        xt = self._x(objetivo)
+        cv.create_line(xt, 10, xt, 48, fill="#ffffff", width=2)
+        cv.create_polygon(xt - 6, 0, xt + 6, 0, xt, 10, fill="#ffffff", outline="")
+        txt = "tope %g dB" % round(objetivo, 1)
+        if xt > w - 90:
+            cv.create_text(xt - 9, 5, text=txt, fill="#ffffff", font=("Segoe UI", 8, "bold"), anchor="e")
+        else:
+            cv.create_text(xt + 9, 5, text=txt, fill="#ffffff", font=("Segoe UI", 8, "bold"), anchor="w")
+        for db in (-60, -40, -20, -10, -5, 0):
+            cv.create_text(self._x(db), 54, text=str(db), fill="#8a939e", font=("Segoe UI", 7))
+        # --- el damper: el volumen de la app que el nivelador va moviendo (-40 dB ... 0 dB) ---
+        x0, x1 = self.X0, w - self.X0
+        cv.create_rectangle(x0, 64, x1, 80, fill="#262b32", outline="")
+        if vol is not None:
+            vdb = 20.0 * math.log10(vol) if vol > 0.001 else -99.0
+            xv = x0 + (max(-40.0, min(0.0, vdb)) + 40.0) / 40.0 * (x1 - x0)
+            cv.create_rectangle(x0, 64, xv, 80, fill="#e67e22", outline="")
+            if self.vol_prev is not None and abs(vol - self.vol_prev) > 0.002:
+                self.sube, self.sube_t = (1 if vol > self.vol_prev else -1), ahora
+            elif ahora - self.sube_t > 0.6:
+                self.sube = 0
+            self.vol_prev = vol
+            flecha = {1: "  ▲ subiendo", -1: "  ▼ bajando", 0: ""}[self.sube]
+            cv.create_text(x0 + 6, 72, anchor="w", fill="#ffffff", font=("Segoe UI", 8, "bold"),
+                           text="VOLUMEN %d %% (%.1f dB)%s" % (round(vol * 100), vdb, flecha))
+        else:
+            cv.create_text(x0 + 6, 72, anchor="w", fill="#8a939e", font=("Segoe UI", 8),
+                           text="VOLUMEN: sin sesión de audio")
+        # --- textos ---
+        if not vivo_ok:
+            estado = "Sin audio"
+        elif pre > Nivelador.SILENCIO:
+            estado = "Nivelando"
+        else:
+            estado = "En silencio"
+        if estado != self.lbl_estado.cget("text"):
+            self.lbl_estado.config(text=estado, foreground="#1e8449" if estado == "Nivelando" else "#888888")
+        if not vivo_ok:
+            cancion = ""
+        elif vivo["titulo"] is None:
+            cancion = "Canción: (sin título fiable: se nivela en directo, sin memoria)"
+        elif vivo["veces"] > 0:
+            cancion = "Canción conocida (reproducida %d veces): %s%s" % (
+                vivo["veces"], vivo["titulo"][:60],
+                "  ·  esperado ahora %g dB" % round(vivo["previsto"]) if vivo["previsto"] is not None else "")
+        else:
+            cancion = "Canción nueva, aprendiéndola: %s" % vivo["titulo"][:60]
+        if cancion != self.lbl_cancion.cget("text"):
+            self.lbl_cancion.config(text=cancion)
+
+
+# ----------------------------------------------------------------------
 # Aplicación principal
 # ----------------------------------------------------------------------
 class App:
@@ -2314,6 +2540,11 @@ class App:
         self._vol_t_prev = 0.0
         self._vol_ses = []
         self._vol_log_t = {}
+        self._rastreadores = {}             # app -> Rastreador (canción en curso y su memoria)
+        self._ras_t = {}
+        self._niv_vivo = {}                 # app -> lo que se ve en la pestaña Niveles
+        self._obj_tmp = {}                  # app -> tope que se está arrastrando ahora mismo
+        self._arrastre_activo = False
         self._nivelando = False
         self.cola_nivelar = []
         global FORMATO_12H
@@ -2411,14 +2642,17 @@ class App:
         self.tab_audios = ttk.Frame(nb)
         self.tab_cats = ttk.Frame(nb)
         self.tab_apps = ttk.Frame(nb)
+        self.tab_niv = ttk.Frame(nb)
         self.tab_sis = ttk.Frame(nb)
         nb.add(self.tab_audios, text="  Audios  ")
         nb.add(self.tab_cats, text="  Categorías  ")
         nb.add(self.tab_apps, text="  Apps  ")
+        nb.add(self.tab_niv, text="  Niveles  ")
         nb.add(self.tab_sis, text="  Sistema  ")
         self.ui_audios()
         self.ui_categorias()
         self.ui_apps()
+        self.ui_niveles()
         self.ui_sistema()
 
     # ---------------- pestaña Apps: quién usa el audio y a quién se atenúa ----------------
@@ -2661,7 +2895,10 @@ class App:
         if modo == 0:
             d.pop(s[0], None)
         else:
+            previo = d.get(s[0], {}).get("objetivo")           # el tope propio de la app se conserva
             d[s[0]] = {"pct": pct, "modo": "fijo" if modo == 1 else "nivelar"}
+            if previo is not None:
+                d[s[0]]["objetivo"] = previo
         self.db.set_cfg("vol_apps", json.dumps(d))
         self._niveladores = {}
         self._vol_t_cfg = 0.0
@@ -2697,8 +2934,62 @@ class App:
             pass
         return res
 
+    # ---- memoria de canciones (nivelador que se anticipa) ----
+    NAVEGADORES = {"chrome", "msedge", "brave", "firefox", "opera", "vivaldi", "iexplore", "waterfox",
+                   "chromium", "opera_gx", "yandex"}
+
+    def _titulo_cancion(self, pid, clave):
+        """Título de la canción que suena en una app (con artista si Windows lo da), o None si no
+        se puede saber con seguridad. En un navegador la ventana lleva el título de la pestaña
+        ACTIVA: solo se fía de ella si es YouTube Music; si el usuario cambia de pestaña, sigue
+        siendo la misma canción."""
+        base = clave.rsplit(".", 1)[0]
+        if self.lector is not None:
+            cand = [d for d in self.lector.datos if base in d["app"].lower()]
+            if cand:
+                d = max(cand, key=lambda x: x["suena"])
+                if d["titulo"]:
+                    return ("%s — %s" % (d["titulo"], d["artista"]) if d["artista"] else d["titulo"])[:200]
+        raw = titulo_ventana(pid) if pid else None
+        if not raw:
+            return None
+        if base in self.NAVEGADORES and "youtube music" not in raw.lower():
+            return None
+        t = limpiar_titulo(raw, [base])
+        if not t or t.lower() in _NOMBRES_SERVICIOS or t.lower() == base:
+            return None
+        return t[:200]
+
+    def _cargar_perfil(self, clave, titulo):
+        r = self.db.q("SELECT env, veces FROM perfiles WHERE clave_app=? AND cancion=?", (clave, titulo))
+        if not r:
+            return None
+        try:
+            env = json.loads(r[0]["env"])
+        except ValueError:
+            return None
+        return PerfilCancion(env, r[0]["veces"] or 1) if isinstance(env, list) else None
+
+    def _guardar_perfil(self, clave, titulo, p):
+        self.db.x("INSERT OR REPLACE INTO perfiles(clave_app, cancion, env, veces, pico, actualizado) "
+                  "VALUES(?,?,?,?,?,?)", (clave, titulo, json.dumps(p.env, separators=(",", ":")),
+                                          p.veces, p.pico, time.strftime("%Y-%m-%d %H:%M")))
+        n = self.db.q("SELECT COUNT(*) FROM perfiles")[0][0]
+        if n > 3000:                                    # la memoria no crece sin límite
+            self.db.x("DELETE FROM perfiles WHERE rowid IN (SELECT rowid FROM perfiles "
+                      "ORDER BY actualizado LIMIT ?)", (n - 2800,))
+
+    def _cerrar_rastreadores(self):
+        for r in list(self._rastreadores.values()):
+            try:
+                r.cerrar()
+            except Exception:
+                pass
+        self._rastreadores = {}
+        self._ras_t = {}
+
     def _ciclo_volumenes(self):
-        """Cada 60 ms. Con el bloqueo activo: mantiene el volumen general de Windows y el de las
+        """Cada 30 ms. Con el bloqueo activo: mantiene el volumen general de Windows y el de las
         apps «Fijo», y mueve el de las apps «Nivelar» según su señal."""
         try:
             self._volumenes(time.time())
@@ -2707,7 +2998,7 @@ class App:
             if clave != getattr(self, "_ult_error_vol", None):
                 self._ult_error_vol = clave
                 self.log("Error en el bloqueo de volúmenes (se sigue funcionando): " + clave)
-        self.root.after(60, self._ciclo_volumenes)
+        self.root.after(30, self._ciclo_volumenes)
 
     def _volumenes(self, ahora):
         if AudioUtilities is None:
@@ -2722,7 +3013,10 @@ class App:
             self._volcfg = dict(
                 bloqueo=self.db.cfg("vol_bloqueo", "0") == "1",
                 maestro=int(m) if m.isdigit() else None,
-                apps=self.cfg_dict("vol_apps"), objetivo=objetivo)
+                apps=self.cfg_dict("vol_apps"), objetivo=objetivo,
+                memoria=self.db.cfg("niv_memoria", "1") == "1")
+            if not self._arrastre_activo:        # (el tope arrastrado ya está en la configuración)
+                self._obj_tmp = {}
             c = self._volcfg
             if c["bloqueo"] and c["maestro"] is not None:
                 antes = volumen_maestro(c["maestro"] / 100.0)
@@ -2733,6 +3027,12 @@ class App:
                 retener_caidos(_x[2], _x[3])
             self._vol_ses = self._sesiones_fijadas(c["apps"]) if (c["bloqueo"] and c["apps"]) else []
             nombres = sorted({x[1] for x in self._vol_ses})
+            for k in [k for k in self._rastreadores if k not in nombres]:    # la app dejó de sonar/cerró
+                try:
+                    self._rastreadores.pop(k).cerrar()
+                except Exception:
+                    pass
+                self._niv_vivo.pop(k, None)
             if nombres != getattr(self, "_vol_nombres", None):      # solo cuando cambia
                 self._vol_nombres = nombres
                 if nombres:
@@ -2742,6 +3042,9 @@ class App:
         c = self._volcfg
         if not c or not c["bloqueo"] or not self._vol_ses:
             self._vol_t_prev = ahora
+            if self._rastreadores:                  # el nivelador se paró: se guarda lo aprendido
+                self._cerrar_rastreadores()
+            self._niv_vivo = {}
             return
         if self.rep.duck_o > 0.0:                   # suena un audio que baja a las otras apps: no se toca
             self._vol_t_prev = ahora
@@ -2762,11 +3065,37 @@ class App:
                         self._log_vol(clave, "Volumen de %s corregido: estaba al %d %%, vuelve al "
                                       "%d %%." % (clave, round(actual * 100), round(objetivo_v * 100)))
                 elif meter is not None:
+                    objetivo_app = self._obj_tmp.get(clave, cfg.get("objetivo", c["objetivo"]))
                     niv = self._niveladores.get(pid)
                     if niv is None:
-                        niv = self._niveladores[pid] = Nivelador(c["objetivo"], 0.03, objetivo_v)
+                        niv = self._niveladores[pid] = Nivelador(objetivo_app, 0.03, objetivo_v)
+                    niv.objetivo = objetivo_app                 # (se puede mover con la barra en vivo)
                     pico = meter.GetPeakValue()
-                    nuevo = niv.paso(pico, actual, dt)
+                    pdb = Nivelador._db(pico)
+                    previsto, saltar, ras = None, False, None
+                    if c["memoria"]:
+                        try:       # un fallo de la memoria (base de datos...) nunca debe tumbar el nivelador
+                            ras = self._rastreadores.get(clave)
+                            if ras is None:
+                                ras = self._rastreadores[clave] = Rastreador(
+                                    lambda t, k=clave: self._cargar_perfil(k, t),
+                                    lambda t, p, k=clave: self._guardar_perfil(k, t, p))
+                            if ahora - self._ras_t.get(clave, 0.0) > 0.5:     # la canción: 2 veces por segundo
+                                self._ras_t[clave] = ahora
+                                tit = self._titulo_cancion(pid, clave)
+                                if tit:                                        # sin título fiable no se cambia nada
+                                    ras.cambiar(tit)
+                            previsto, saltar = ras.paso(pdb, dt), ras.nueva
+                            ras.nueva = False
+                        except Exception as e2:
+                            previsto, saltar = None, False
+                            self._log_vol("memoria", "Memoria de canciones: " + motivo_error(e2))
+                    nuevo = niv.paso(pico, actual, dt, previsto, saltar)
+                    self._niv_vivo[clave] = dict(
+                        pre=pdb, vol=actual, entrada=niv.entrada, objetivo=objetivo_app,
+                        t=ras.t if ras else 0.0, titulo=ras.titulo if ras else None,
+                        veces=ras.perfil.veces if (ras and ras.perfil) else 0,
+                        previsto=previsto, ahora=ahora)
                     # v1.5.1: el umbral es relativo (0,05 dB), no fijo: con 0,003 a volumen bajo (10 %) cada paso de subida (3 dB/s a 60 ms = 0,002)
                     # se descartaba siempre y el volumen casi no se recuperaba tras una canción más baja o la barra de la página bajada.
                     if abs(Nivelador._db(max(nuevo, 1e-4)) - Nivelador._db(max(actual, 1e-4))) > 0.05:
@@ -2786,6 +3115,239 @@ class App:
                     _CEMENTERIO.extend(p for p in (_x[2], _x[3]) if p is not None)      # ya fallaron: no se sueltan
             self._vol_ses = [x for x in self._vol_ses if x[0] not in caidas]
             self._vol_t_cfg = 0.0
+
+    # ---------------- pestaña Niveles ----------------
+    def ui_niveles(self):
+        f = self.tab_niv
+        ttk.Label(f, wraplength=1100, foreground="#555555", justify="left", text=(
+            "Cada app de la lista se mantiene en el nivel que tú pongas: si suena más fuerte, el "
+            "programa le baja el volumen; si suena más bajo, se lo sube. La línea blanca es el TOPE "
+            "(arrástrala con el ratón); la barra naranja de abajo es el volumen que el nivelador le va "
+            "dando a esa app. Las canciones se recuerdan por su nombre: a la segunda vez ya se sabe "
+            "dónde están sus picos y el volumen baja ANTES de que lleguen."),
+                  ).pack(anchor="w", padx=10, pady=(10, 4))
+        sup = ttk.Frame(f)
+        sup.pack(fill="x", padx=10)
+        ttk.Checkbutton(sup, text="Nivelador activo (el mismo «Mantener los volúmenes» de Apps)",
+                        variable=self.v_bloqueo, command=self.cambiar_bloqueo).pack(side="left")
+        self.v_memoria = tk.IntVar(value=1 if self.db.cfg("niv_memoria", "1") == "1" else 0)
+        ttk.Checkbutton(sup, text="Recordar canciones y anticiparse a sus picos",
+                        variable=self.v_memoria, command=self.guardar_memoria).pack(side="left", padx=18)
+        self.lbl_niv_aviso = ttk.Label(f, text="", foreground="#b9770e", font=("Segoe UI", 9, "bold"))
+        self.lbl_niv_aviso.pack(anchor="w", padx=10, pady=(2, 0))
+        add = ttk.Frame(f)
+        add.pack(fill="x", padx=10, pady=(6, 2))
+        ttk.Label(add, text="Añadir una app al nivelador:").pack(side="left")
+        self.v_niv_app = tk.StringVar()
+        self.cb_niv_app = ttk.Combobox(add, textvariable=self.v_niv_app, state="readonly", width=34)
+        self.cb_niv_app.pack(side="left", padx=6)
+        self.cb_niv_app.bind("<Button-1>", lambda e: self._llenar_apps_niv())
+        ttk.Button(add, text="Nivelar esta app", command=self.nivelar_app_elegida).pack(side="left")
+        self.fr_filas = ttk.Frame(f)
+        self.fr_filas.pack(fill="x", padx=10, pady=4)
+        self.filas_niv = {}                       # clave -> FilaNivel
+        self.lbl_niv_vacio = ttk.Label(f, foreground="#888888", text=(
+            "Todavía no hay ninguna app en el nivelador. Elige una en la lista de arriba (tiene que "
+            "estar sonando) y pulsa «Nivelar esta app»."))
+        # --- memoria de canciones ---
+        lm = ttk.LabelFrame(f, text="Memoria de canciones", padding=6)
+        lm.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+        cols = ("app", "veces", "pico", "ultima")
+        self.tree_mem = ttk.Treeview(lm, columns=cols, selectmode="browse", height=6)
+        self.tree_mem.heading("#0", text="Canción")
+        for c, t, w in (("app", "App", 110), ("veces", "Veces", 60), ("pico", "Pico (dB)", 80),
+                        ("ultima", "Última vez", 130)):
+            self.tree_mem.heading(c, text=t)
+            self.tree_mem.column(c, width=w, anchor="center")
+        self.tree_mem.column("#0", width=520)
+        sb = ttk.Scrollbar(lm, orient="vertical", command=self.tree_mem.yview)
+        self.tree_mem.configure(yscrollcommand=sb.set)
+        bt = ttk.Frame(lm)
+        bt.pack(side="bottom", fill="x", pady=(6, 0))
+        self.lbl_mem = ttk.Label(bt, text="", foreground="#555555")
+        self.lbl_mem.pack(side="left")
+        ttk.Button(bt, text="Olvidar todas", command=self.olvidar_todo).pack(side="right")
+        ttk.Button(bt, text="Olvidar la elegida", command=self.olvidar_perfil).pack(side="right", padx=6)
+        ttk.Button(bt, text="Actualizar", command=self.refrescar_memoria).pack(side="right")
+        sb.pack(side="right", fill="y")
+        self.tree_mem.pack(side="left", fill="both", expand=True)
+        self._niv_t_filas = 0.0
+        self._niv_t_mem = 0.0
+        self._niv_t = time.time()
+        self._arrastre_activo = False
+        self.root.after(1500, self._ciclo_niveles)
+
+    def _llenar_apps_niv(self):
+        apps = self._listar_apps()
+        ya = {k for k, v in self.cfg_dict("vol_apps").items() if v.get("modo") == "nivelar"}
+        self._niv_opciones = {}
+        for k, d in sorted(apps.items(), key=lambda x: (not x[1]["activo"], x[0])):
+            if k in ya:
+                continue
+            nombre = (descripcion_exe(d["ruta"]) if d["ruta"] else None) or d["nombre"].rsplit(".", 1)[0]
+            etiqueta = "%s  (%s)%s" % (nombre, d["nombre"], "  · sonando" if d["activo"] else "")
+            self._niv_opciones[etiqueta] = k
+        self.cb_niv_app["values"] = list(self._niv_opciones)
+
+    def nivelar_app_elegida(self):
+        k = getattr(self, "_niv_opciones", {}).get(self.v_niv_app.get())
+        if not k:
+            messagebox.showinfo("Niveles", "Elige primero una app de la lista.", parent=self.root)
+            return
+        d = self.cfg_dict("vol_apps")
+        e = d.get(k, {})
+        e.update(pct=e.get("pct", 100), modo="nivelar")
+        d[k] = e
+        self.db.set_cfg("vol_apps", json.dumps(d))
+        self._niveladores = {}
+        self._vol_t_cfg = 0.0
+        self.v_niv_app.set("")
+        self.log("Volumen de %s: nivelado, hasta el %d %% (desde la pestaña Niveles)." % (k, e["pct"]))
+        self._niv_t_filas = 0.0
+        self.refrescar_apps()
+        self._estado_vol()
+
+    def quitar_nivelado(self, clave):
+        d = self.cfg_dict("vol_apps")
+        if clave in d:
+            d.pop(clave)
+            self.db.set_cfg("vol_apps", json.dumps(d))
+        self._niveladores = {}
+        self._vol_t_cfg = 0.0
+        r = self._rastreadores.pop(clave, None)
+        if r is not None:
+            r.cerrar()
+        self._niv_vivo.pop(clave, None)
+        self.log("Volumen de %s: libre (quitada del nivelador)." % clave)
+        self._niv_t_filas = 0.0
+        self.refrescar_apps()
+
+    def nivel_arrastre(self, clave, db, fin):
+        """El tope de una app se mueve con el ratón: se aplica al instante y se guarda al soltar."""
+        db = round(max(-50.0, min(-3.0, db)), 1)
+        self._arrastre_activo = not fin
+        self._obj_tmp[clave] = db
+        if fin:
+            d = self.cfg_dict("vol_apps")
+            if clave in d:
+                d[clave]["objetivo"] = db
+                self.db.set_cfg("vol_apps", json.dumps(d))
+            self._vol_t_cfg = 0.0
+            self.log("Tope de %s: %g dB." % (clave, db))
+
+    def guardar_memoria(self):
+        self.db.set_cfg("niv_memoria", "1" if self.v_memoria.get() else "0")
+        self._vol_t_cfg = 0.0
+        if not self.v_memoria.get():
+            self._cerrar_rastreadores()
+        self.log("Memoria de canciones del nivelador %s." % (
+            "activada" if self.v_memoria.get() else "desactivada"))
+
+    def _sincronizar_filas(self):
+        """Una fila por cada app en modo «Nivelar»."""
+        apps = self.cfg_dict("vol_apps")
+        quiero = [k for k, v in apps.items() if v.get("modo") == "nivelar"]
+        for k in [k for k in self.filas_niv if k not in quiero]:
+            self.filas_niv.pop(k).f.destroy()
+        nuevas = [k for k in quiero if k not in self.filas_niv]
+        info = self._listar_apps() if nuevas else {}
+        for k in nuevas:
+            d = info.get(k, {})
+            ruta = d.get("ruta")
+            if ruta and ruta not in self.iconos_apps:
+                self.iconos_apps[ruta] = icono_exe(ruta)
+            nombre = (descripcion_exe(ruta) if ruta else None) or k.rsplit(".", 1)[0]
+            self.filas_niv[k] = FilaNivel(self, self.fr_filas, k, nombre,
+                                          self.iconos_apps.get(ruta) if ruta else None)
+        for k in quiero:                                   # (orden estable)
+            self.filas_niv[k].f.pack_forget()
+        for k in quiero:
+            self.filas_niv[k].f.pack(fill="x", pady=3)
+        if quiero:
+            self.lbl_niv_vacio.pack_forget()
+        elif not self.lbl_niv_vacio.winfo_ismapped():
+            self.lbl_niv_vacio.pack(anchor="w", padx=10, before=self.fr_filas)
+        if self.db.cfg("vol_bloqueo", "0") != "1":
+            self.lbl_niv_aviso.config(text="El nivelador está APAGADO: marca «Nivelador activo» para que "
+                                           "empiece a trabajar.")
+        else:
+            self.lbl_niv_aviso.config(text="")
+        return apps
+
+    def refrescar_memoria(self):
+        sel = self.tree_mem.selection()
+        self.tree_mem.delete(*self.tree_mem.get_children())
+        filas = self.db.q("SELECT rowid, clave_app, cancion, veces, pico, actualizado FROM perfiles "
+                          "ORDER BY actualizado DESC LIMIT 500")
+        for r in filas:
+            self.tree_mem.insert("", "end", iid=str(r["rowid"]), text="  " + r["cancion"], values=(
+                r["clave_app"].rsplit(".", 1)[0], r["veces"], "%.1f" % (r["pico"] if r["pico"] is not None else -99.0),
+                r["actualizado"] or ""))
+        for s_ in sel:
+            if self.tree_mem.exists(s_):
+                self.tree_mem.selection_set(s_)
+        total = self.db.q("SELECT COUNT(*) FROM perfiles")[0][0]
+        self.lbl_mem.config(text="%d canción(es) recordadas%s." % (
+            total, " (se muestran las 500 más recientes)" if total > 500 else ""))
+
+    def olvidar_perfil(self):
+        s = self.tree_mem.selection()
+        if not s:
+            messagebox.showinfo("Memoria", "Elige primero una canción de la lista.", parent=self.root)
+            return
+        self.db.x("DELETE FROM perfiles WHERE rowid=?", (int(s[0]),))
+        for r in self._rastreadores.values():           # por si es la que suena: que no se vuelva a fundir
+            r.perfil = None
+            r.obs = {}
+        self.refrescar_memoria()
+
+    def olvidar_todo(self):
+        if not messagebox.askyesno("Memoria", "¿Olvidar todas las canciones recordadas?\n"
+                                   "Se irán aprendiendo de nuevo.", parent=self.root):
+            return
+        self.db.x("DELETE FROM perfiles")
+        for r in self._rastreadores.values():
+            r.perfil = None
+            r.obs = {}
+        self.refrescar_memoria()
+
+    def _ciclo_niveles(self):
+        ahora = time.time()
+        dt = min(0.2, max(0.001, ahora - self._niv_t))
+        self._niv_t = ahora
+        espera = 400
+        try:
+            if (self.nb.index("current") == self.nb.index(self.tab_niv)
+                    and self.root.winfo_viewable()):
+                espera = 40
+                if not getattr(self, "_niv_lista_ok", False):
+                    self._niv_lista_ok = True
+                    self._llenar_apps_niv()
+                if ahora - self._niv_t_filas > 1.5:
+                    self._niv_t_filas = ahora
+                    self._sincronizar_filas()
+                if ahora - self._niv_t_mem > 5.0:
+                    self._niv_t_mem = ahora
+                    self.refrescar_memoria()
+                apps = self.cfg_dict("vol_apps") if ahora - getattr(self, "_niv_t_cfg", 0.0) > 1.0 else None
+                if apps is not None:
+                    self._niv_t_cfg = ahora
+                    self._niv_objs = {k: v.get("objetivo", None) for k, v in apps.items()}
+                for k, fila in self.filas_niv.items():
+                    obj = self._obj_tmp.get(k)
+                    if obj is None:
+                        obj = (getattr(self, "_niv_objs", {}).get(k)
+                               if getattr(self, "_niv_objs", {}).get(k) is not None
+                               else float(self.db.cfg("vol_objetivo", "-18") or -18))
+                    fila.dibujar(self._niv_vivo.get(k), dt, ahora, obj)
+        except tk.TclError:
+            pass
+        except Exception as e:
+            clave = motivo_error(e)
+            if clave != getattr(self, "_ult_error_niv", None):
+                self._ult_error_niv = clave
+                self.log("Error al dibujar la pestaña Niveles (se sigue funcionando): " + clave)
+        self.root.after(espera, self._ciclo_niveles)
 
     def _ciclo_apps(self):
         try:
@@ -4583,6 +5145,7 @@ class App:
                     "Si lo cierras, los audios programados dejarán de sonar.\n"
                     "¿Cerrar definitivamente?"):
                 return
+        self._cerrar_rastreadores()                 # guarda lo aprendido de la canción en curso
         self.rep.cerrar()
         if self.icono:
             try:
