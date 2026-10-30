@@ -51,7 +51,7 @@ except Exception:
 
 APP = "ProgramadorAudios"   # nombre interno: carpeta de datos, registro y tarea (no cambiar)
 NOMBRE = "Audiomático"      # nombre que ve el usuario
-VERSION = "1.6.0"          # igual que en instalador.iss
+VERSION = "1.6.1"        # igual que en instalador.iss
 # colores de categoría (se asignan solos, rotando) y fuente exclusiva de la prioridad
 PALETA = ["#d9534f", "#f0ad4e", "#5cb85c", "#3ea6c4", "#6f7bd9", "#a463c9", "#e0679a",
           "#8d6e63"]
@@ -2213,6 +2213,17 @@ def limpiar_titulo(titulo, extras=()):
     return " – ".join(partes) if partes else titulo
 
 
+def solo_nombres_de_servicio(titulo, extras=()):
+    """True si el título solo trae nombres de servicio o navegador ('YouTube Music - Mozilla
+    Firefox' mientras carga la página): no es una canción."""
+    ignorar = _NOMBRES_SERVICIOS | {e.lower() for e in extras if e}
+    for bloque in (titulo or "").split(" | "):
+        for p in re.split(r"\s+[-–—]\s+", bloque):
+            if p.strip() and p.strip().lower() not in ignorar:
+                return False
+    return True
+
+
 class LectorMedios(threading.Thread):
     """Lee cada segundo qué suena en las apps con los controles multimedia de Windows 10/11
     (título, artista, posición y duración). Corre en su propio hilo; el resto del programa
@@ -2954,6 +2965,8 @@ class App:
         if not raw:
             return None
         if base in self.NAVEGADORES and "youtube music" not in raw.lower():
+            return None
+        if solo_nombres_de_servicio(raw, [base]):
             return None
         t = limpiar_titulo(raw, [base])
         if not t or t.lower() in _NOMBRES_SERVICIOS or t.lower() == base:
