@@ -1,5 +1,10 @@
 # Historial de cambios
 
+## 1.6.1
+Corrige la **memoria de canciones** con títulos genéricos.
+
+- Mientras YouTube Music carga la página, la ventana se llama solo «YouTube Music – Mozilla Firefox»: el programa ya no lo toma por una canción ni le guarda un perfil inútil en la lista de canciones recordadas.
+
 ## 1.6.0
 **Pestaña Niveles** y un nivelador que **recuerda las canciones** y se anticipa a sus picos.
 
